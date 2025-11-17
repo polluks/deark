@@ -183,6 +183,8 @@ $(OBJDIR)/modules/macpaint.o: modules/macpaint.c src/deark-config.h \
  src/deark-private.h src/deark.h src/deark-fmtutil.h
 $(OBJDIR)/modules/macrsrc.o: modules/macrsrc.c src/deark-config.h \
  src/deark-private.h src/deark.h src/deark-fmtutil.h
+$(OBJDIR)/modules/mahjong.o: modules/mahjong.c src/deark-private.h \
+ src/deark.h src/deark-config.h src/deark-fmtutil.h
 $(OBJDIR)/modules/makichan.o: modules/makichan.c src/deark-config.h \
  src/deark-private.h src/deark.h
 $(OBJDIR)/modules/mbk.o: modules/mbk.c src/deark-config.h \
@@ -243,10 +245,10 @@ $(OBJDIR)/modules/palmpdb.o: modules/palmpdb.c src/deark-config.h \
  src/deark-private.h src/deark.h
 $(OBJDIR)/modules/pcf.o: modules/pcf.c src/deark-config.h \
  src/deark-private.h src/deark.h
-$(OBJDIR)/modules/pcpaint.o: modules/pcpaint.c src/deark-config.h \
- src/deark-private.h src/deark.h
-$(OBJDIR)/modules/pcx.o: modules/pcx.c src/deark-config.h \
- src/deark-private.h src/deark.h
+$(OBJDIR)/modules/pcpaint.o: modules/pcpaint.c src/deark-private.h \
+ src/deark.h src/deark-config.h src/deark-fmtutil.h
+$(OBJDIR)/modules/pcx.o: modules/pcx.c src/deark-private.h src/deark.h \
+ src/deark-config.h src/deark-fmtutil.h
 $(OBJDIR)/modules/pff2.o: modules/pff2.c src/deark-config.h \
  src/deark-private.h src/deark.h src/deark-fmtutil.h
 $(OBJDIR)/modules/pict.o: modules/pict.c src/deark-config.h \
@@ -407,6 +409,8 @@ $(OBJDIR)/src/fmtutil-lzw.o: src/fmtutil-lzw.c src/deark-private.h \
 $(OBJDIR)/src/fmtutil-miniz.o: src/fmtutil-miniz.c src/deark-config.h \
  src/deark-private.h src/deark.h src/deark-fmtutil.h \
  src/../foreign/miniz-c.h src/../foreign/miniz.h
+$(OBJDIR)/src/fmtutil-rle.o: src/fmtutil-rle.c src/deark-private.h \
+ src/deark.h src/deark-config.h src/deark-fmtutil.h
 $(OBJDIR)/src/fmtutil-zip.o: src/fmtutil-zip.c src/deark-config.h \
  src/deark-private.h src/deark.h src/deark-fmtutil.h \
  src/../foreign/ozunreduce.h

@@ -18,29 +18,37 @@ struct grabber_id_data {
 	i64 jmppos;
 };
 
+#define GR_CMPR_PCX      1
+#define GR_CMPR_PCPAINT  2
+
 typedef struct localctx_grabber {
+	u8 is_exe;
 	u8 errflag;
 	u8 need_errmsg;
 
 	u8 screen_mode;
 	u8 screen_mode2;
 	u8 pal_info;
+	i64 hdrpos;
 	i64 data_ori_pos, data_ori_len;
 	dbuf *data_f;
 	i64 data_f_pos, data_f_len;
 	de_finfo *fi;
 
-	u8 fmt_known;
+	u8 file_structure_supported;
 	i64 pos_of_mode; // May be for COM only
+	i64 reported_w, reported_h;
 	i64 reported_w_in_chars, reported_h_in_chars;
 
 	struct de_char_context *charctx;
 	struct fmtutil_char_simplectx csctx;
 	struct grabber_id_data gi;
-	de_color pal[256];
 
 	struct fmtutil_exe_info ei;
 	struct fmtutil_specialexe_detection_data edd;
+
+	de_color pal[256];
+	de_color pal2[256];
 } lctx;
 
 static void free_lctx(deark *c, lctx *d)
@@ -49,6 +57,76 @@ static void free_lctx(deark *c, lctx *d)
 	de_finfo_destroy(c, d->fi);
 	de_free_charctx(c, d->charctx);
 	de_free(c, d);
+}
+
+static void gr_decompress_any(deark *c, lctx *d,
+	UI cmpr_meth,
+	i64 cmpr_pos, i64 cmpr_len, dbuf *unc_data,
+	i64 num_dcmpr_bytes_expected)
+{
+	struct de_dfilter_in_params dcmpri;
+	struct de_dfilter_out_params dcmpro;
+	struct de_dfilter_results dres;
+	int saved_indent_level;
+
+	de_dbg_indent_save(c, &saved_indent_level);
+	de_dfilter_init_objects(c, &dcmpri, &dcmpro, &dres);
+	dcmpri.f = c->infile;
+	dcmpri.pos = cmpr_pos;
+	dcmpri.len = cmpr_len;
+	dcmpro.f = unc_data;
+	dcmpro.len_known = 1;
+	dcmpro.expected_len = num_dcmpr_bytes_expected;
+
+	de_dbg(c, "[decompressing]");
+	de_dbg_indent(c, 1);
+	if(cmpr_meth==GR_CMPR_PCPAINT) {
+		struct de_pcpaint_rle_params *pcpp;
+
+		pcpp = de_malloc(c, sizeof(struct de_pcpaint_rle_params));
+		fmtutil_pcpaintrle_codectype1(c, &dcmpri, &dcmpro, &dres, (void*)pcpp);
+		de_free(c, pcpp);
+	}
+	else {
+		fmtutil_pcxrle_codectype1(c, &dcmpri, &dcmpro, &dres, NULL);
+	}
+
+	if(dres.errcode) {
+		de_err(c, "Decompression failed: %s", dres.errmsg);
+		goto done;
+	}
+	de_dbg(c, "decompressed %"I64_FMT" to %"I64_FMT" bytes",
+		dres.bytes_consumed, unc_data->len);
+done:
+	de_dbg_indent_restore(c, saved_indent_level);
+}
+
+static void read_grabber_palette(deark *c, lctx *d, i64 pos1, i64 num_entries,
+	de_color *pal)
+{
+	de_read_simple_palette(c, c->infile, pos1, num_entries, 3,
+		pal, 256, DE_RDPALTYPE_VGA18BIT, 0);
+}
+
+static void read_grabber_pal_vga16(deark *c, lctx *d, UI ncolors)
+{
+	i64 pal1pos;
+	i64 i;
+	char tmps[32];
+
+	if(ncolors>16) return;
+	pal1pos = d->hdrpos + 2;
+	de_dbg(c, "palette at %"I64_FMT, pal1pos);
+	de_dbg_indent(c, 1);
+	for(i=0; i<(i64)ncolors; i++) {
+		u8 p1;
+
+		p1 = de_getbyte(pal1pos+i);
+		d->pal[i] = d->pal2[(UI)p1];
+		de_snprintf(tmps, sizeof(tmps), "%2u ", (UI)p1);
+		de_dbg_pal_entry2(c, i, d->pal[i], tmps, NULL, NULL);
+	}
+	de_dbg_indent(c, -1);
 }
 
 static void grabber_id_com(deark *c, u8 b0, struct grabber_id_data *gi)
@@ -221,22 +299,26 @@ static void read_and_deinterlace_cga(deark *c, dbuf *inf, i64 pos1, dbuf *outf)
 	}
 }
 
-static void do_grabber_cga(deark *c, lctx *d, dbuf *inf, i64 pos1, i64 len)
+static void do_grabber_cga(deark *c, lctx *d)
 {
 	de_bitmap *img = NULL;
 	dbuf *tmpf = NULL;
 
 	tmpf = dbuf_create_membuf(c, 16384, 0);
-	read_and_deinterlace_cga(c, inf, pos1, tmpf);
+	if(d->is_exe) {
+		dbuf_copy(d->data_f, d->data_f_pos, 16384, tmpf);
+	}
+	else {
+		read_and_deinterlace_cga(c, d->data_f, d->data_f_pos, tmpf);
+	}
 
 	d->fi->density.code = DE_DENSITY_UNK_UNITS;
 
 	if(d->screen_mode==6) {
 		d->fi->density.xdens = 480.0;
 		d->fi->density.ydens = 200.0;
-		de_make_grayscale_palette(d->pal, 2, 0);
 		img = de_bitmap_create(c, 640, 200, 1);
-		de_convert_image_paletted(tmpf, 0, 1, 80, d->pal, img, 0);
+		de_convert_image_bilevel(tmpf, 0, 80, img, 0);
 	}
 	else {
 		int pal_subid = 3;
@@ -248,7 +330,7 @@ static void do_grabber_cga(deark *c, lctx *d, dbuf *inf, i64 pos1, i64 len)
 		// system with CGA-only graphics, in case it made a difference).
 		// I.e., not necessarily the image that should have been captured.
 		// GRABBER seems buggy, but I guess we'll copy the bugs.
-		if(d->gi.fmt_class<=3200) { // v2.10-3.20
+		if(d->is_exe || (!d->is_exe && d->gi.fmt_class<=3200)) { // v2.10-3.20
 			switch((d->pal_info & 0x30)>>4) {
 			case 0: pal_subid = 1; break;
 			case 1: pal_subid = 4; break;
@@ -266,58 +348,38 @@ static void do_grabber_cga(deark *c, lctx *d, dbuf *inf, i64 pos1, i64 len)
 		de_convert_image_paletted(tmpf, 0, 2, 80, d->pal, img, 0);
 	}
 
-	de_bitmap_write_to_file_finfo(img, d->fi, DE_CREATEFLAG_OPT_IMAGE);
+	de_bitmap_write_to_file_finfo(img, d->fi, 0);
 
 	de_bitmap_destroy(img);
 	dbuf_close(tmpf);
 }
 
-static void do_grabber_bitmapmode(deark *c, lctx *d)
+static void do_grabber_v370_cga(deark *c, lctx *d)
 {
-	d->fi = de_finfo_create(c);
+	i64 num_dcmpr_bytes_expected;
+	dbuf *tmpf = NULL;
 
-	if(d->screen_mode==4 || d->screen_mode==6) {
-		do_grabber_cga(c, d, c->infile, d->data_ori_pos, d->data_ori_len);
+	if(d->screen_mode==4 || d->screen_mode==5 || d->screen_mode==6) {
+		;
 	}
 	else {
-		d->errflag = 1;
-		d->need_errmsg = 1;
-		goto done;
-	}
-done:
-	;
-}
-
-static void do_grabber_com(deark *c, lctx *d, de_module_params *mparams, u8 b0)
-{
-	grabber_id_com(c, b0, &d->gi);
-	if(!d->gi.is_grabber) {
 		d->need_errmsg = 1;
 		goto done;
 	}
 
-	de_dbg(c, "format class: %u", d->gi.fmt_class);
-	decode_grabber_com(c, d);
+	num_dcmpr_bytes_expected = 16384;
+	tmpf = dbuf_create_membuf(c, num_dcmpr_bytes_expected, 0);
+	dbuf_enable_wbuffer(tmpf);
+	gr_decompress_any(c, d, GR_CMPR_PCX, d->data_ori_pos, d->data_ori_len,
+		tmpf, num_dcmpr_bytes_expected);
 	if(d->errflag) goto done;
-
-
-	if(d->screen_mode==1 || d->screen_mode==3) {
-		d->data_f = c->infile;
-		d->data_f_pos = d->data_ori_pos;
-		d->data_f_len = d->data_ori_len;
-		do_grabber_textmode(c, d);
-	}
-	else if(d->screen_mode==4 || d->screen_mode==6) {
-		do_grabber_bitmapmode(c, d);
-	}
-	else {
-		d->errflag = 1;
-		d->need_errmsg = 1;
-		goto done;
-	}
+	d->data_f = tmpf;
+	d->data_f_pos = 0;
+	d->data_f_len = tmpf->len;
+	do_grabber_cga(c, d);
 
 done:
-	;
+	dbuf_close(tmpf);
 }
 
 static void rearrange_cmpr_text(deark *c, lctx *d, dbuf *unc_data)
@@ -354,36 +416,136 @@ static void rearrange_cmpr_text(deark *c, lctx *d, dbuf *unc_data)
 	dbuf_flush(unc_data);
 }
 
-static void decompress_rletext_v370(deark *c, lctx *d, dbuf *unc_data,
-	i64 num_dcmpr_bytes_expected)
+static void do_grabber_v370_textmode(deark *c, lctx *d)
 {
-	dbuf *inf = c->infile;
-	i64 inf_pos = d->data_ori_pos;
-	i64 inf_endpos = d->data_ori_pos + d->data_ori_len;
-	i64 nbytes_decompressed = 0;
+	i64 num_dcmpr_bytes_expected;
+	dbuf *tmpf = NULL;
 
-	while(1) {
-		i64 count;
-		u8 b0, b1;
+	num_dcmpr_bytes_expected = d->reported_h_in_chars*d->reported_w_in_chars*2;
+	tmpf = dbuf_create_membuf(c, num_dcmpr_bytes_expected, 0);
+	dbuf_enable_wbuffer(tmpf);
+	gr_decompress_any(c, d, GR_CMPR_PCX, d->data_ori_pos, d->data_ori_len,
+		tmpf, num_dcmpr_bytes_expected);
+	if(d->errflag) goto done;
 
-		if(inf_pos >= inf_endpos) goto done;
-		if(nbytes_decompressed >= num_dcmpr_bytes_expected) goto done;
+	rearrange_cmpr_text(c, d, tmpf);
 
-		b0 = dbuf_getbyte_p(inf, &inf_pos);
-		if(b0 >= 0xc0) {
-			count = (i64)b0 - 0xc0;
-			b1 = dbuf_getbyte_p(inf, &inf_pos);
-			dbuf_write_run(unc_data, b1, count);
-			nbytes_decompressed += count;
+	d->data_f = tmpf;
+	d->data_f_pos = 0;
+	d->data_f_len = tmpf->len;
+	do_grabber_textmode(c, d);
+
+done:
+	dbuf_close(tmpf);
+}
+
+static void do_grabber_v370_vga(deark *c, lctx *d)
+{
+	i64 num_dcmpr_bytes_expected;
+	dbuf *tmpf = NULL;
+	de_bitmap *img = NULL;
+	i64 bpp = 1;
+	i64 bprpp = 1;
+	i64 rowspan = 1;
+	UI ncolors = 0;
+
+	if(d->screen_mode2==0x44) {
+		if(d->screen_mode==0x8f || d->screen_mode==0x91) {
+			bpp = 1;
 		}
 		else {
-			dbuf_writebyte(unc_data, b0);
-			nbytes_decompressed++;
+			bpp = 4;
 		}
+		bprpp = de_pad_to_n(d->reported_w, 8)/8;
+		rowspan = bprpp * bpp;
+	}
+	else if(d->screen_mode2==0x55) {
+		bpp = 8;
+		rowspan = d->reported_w;
+	}
+	else {
+		d->need_errmsg = 1;
+		goto done;
+	}
+
+	ncolors = 1 << (UI)bpp;
+
+	if(d->screen_mode2==0x44) {
+		if(d->screen_mode & 0x80) {
+			read_grabber_palette(c, d, d->data_ori_pos-768, 64, d->pal2);
+		}
+		else {
+			de_copy_std_palette(DE_PALID_EGA64, 0, 0, d->pal2, 64, 0);
+		}
+		read_grabber_pal_vga16(c, d, ncolors);
+	}
+	else {
+		read_grabber_palette(c, d, d->data_ori_pos-768, 256, d->pal);
+	}
+
+	num_dcmpr_bytes_expected = rowspan * d->reported_h;
+	tmpf = dbuf_create_membuf(c, num_dcmpr_bytes_expected, 0);
+	dbuf_enable_wbuffer(tmpf);
+	gr_decompress_any(c, d, GR_CMPR_PCPAINT, d->data_ori_pos, d->data_ori_len,
+		tmpf, num_dcmpr_bytes_expected);
+	if(d->errflag) goto done;
+
+	d->fi->density.code = DE_DENSITY_UNK_UNITS;
+
+	if(d->reported_w==320 || d->reported_w==640 || d->reported_w==800 ||
+		d->reported_w==1024)
+	{
+		d->fi->density.xdens = (double)d->reported_w*0.75;
+		d->fi->density.ydens = (double)d->reported_h;
+	}
+
+	img = de_bitmap_create(c, d->reported_w, d->reported_h, 3);
+	if(d->screen_mode2==0x44) {
+		de_convert_image_paletted_planar(tmpf, 0, bpp, rowspan, bprpp, d->pal,
+			img, 0x2);
+	}
+	else {
+		de_convert_image_paletted(tmpf, 0, bpp, rowspan, d->pal, img, 0);
+	}
+	de_bitmap_write_to_file_finfo(img, d->fi, 0);
+
+done:
+	dbuf_close(tmpf);
+	de_bitmap_destroy(img);
+}
+
+static void do_grabber_com(deark *c, lctx *d, de_module_params *mparams, u8 b0)
+{
+	grabber_id_com(c, b0, &d->gi);
+	if(!d->gi.is_grabber) {
+		d->need_errmsg = 1;
+		goto done;
+	}
+
+	de_dbg(c, "format class: %u", d->gi.fmt_class);
+	decode_grabber_com(c, d);
+	if(d->errflag) goto done;
+
+	if(d->screen_mode==1 || d->screen_mode==3) {
+		d->data_f = c->infile;
+		d->data_f_pos = d->data_ori_pos;
+		d->data_f_len = d->data_ori_len;
+		do_grabber_textmode(c, d);
+	}
+	else if(d->screen_mode==4 || d->screen_mode==6) {
+		d->data_f = c->infile;
+		d->data_f_pos = d->data_ori_pos;
+		d->data_f_len = d->data_ori_len;
+		do_grabber_cga(c, d);
+	}
+	else {
+		d->errflag = 1;
+		d->need_errmsg = 1;
+		goto done;
 	}
 
 done:
-	dbuf_flush(unc_data);
+	;
 }
 
 struct grabber_exe_id_item {
@@ -399,16 +561,14 @@ static const struct grabber_exe_id_item grabber_exe_id_arr[] = {
 	{ (const u8*)"G5\x27\xf1\x53\x90\xbc\x13\x04\xd4", 10, 3770 }
 };
 
+// If successful, sets d->file_structure_supported
 static void analyze_grabber_exe(deark *c, lctx *d)
 {
 	u8 *mem = NULL;
-	d->fmt_known = 0;
 	size_t i;
 	u8 found_flag = 0;
 	size_t found_idx = 0;
 	i64 foundpos = 0;
-	i64 hdrpos;
-	i64 size_x, size_y;
 	int saved_indent_level;
 
 	de_dbg_indent_save(c, &saved_indent_level);
@@ -436,27 +596,27 @@ static void analyze_grabber_exe(deark *c, lctx *d)
 	de_dbg(c, "found marker type %u at %"I64_FMT,
 		(UI)grabber_exe_id_arr[found_idx].approx_ver,
 		foundpos);
-	hdrpos = foundpos + grabber_exe_id_arr[found_idx].marker_len;
-	de_dbg(c, "header at %"I64_FMT, hdrpos);
+	d->file_structure_supported = 1;
+	d->gi.fmt_class = (UI)grabber_exe_id_arr[found_idx].approx_ver;
+	d->hdrpos = foundpos + grabber_exe_id_arr[found_idx].marker_len;
+	de_dbg(c, "header at %"I64_FMT, d->hdrpos);
 	de_dbg_indent(c, 1);
-	d->screen_mode2 = de_getbyte(hdrpos);
-	d->screen_mode = de_getbyte(hdrpos+1);
+	d->screen_mode2 = de_getbyte(d->hdrpos);
+	d->screen_mode = de_getbyte(d->hdrpos+1);
 	de_dbg(c, "mode: %02x:%02x", (UI)d->screen_mode2, (UI)d->screen_mode);
 
-	size_x = de_getu16le(hdrpos+19);
-	size_y = de_getu16le(hdrpos+21);
-	de_dbg(c, "size: %"I64_FMT DE_CHAR_TIMES "%"I64_FMT, size_x, size_y);
+	if(d->screen_mode==4 || d->screen_mode==5) {
+		d->pal_info = de_getbyte(d->hdrpos+2);
+		de_dbg(c, "palette info: 0x%02x", (UI)d->pal_info);
+	}
 
-	d->data_ori_pos = de_getu16le(hdrpos+36);
-	de_dbg(c, "image pos: %"I64_FMT, d->data_ori_pos);
+	d->reported_w = de_getu16le(d->hdrpos+19);
+	d->reported_h = de_getu16le(d->hdrpos+21);
+	de_dbg(c, "size: %"I64_FMT DE_CHAR_TIMES "%"I64_FMT, d->reported_w, d->reported_h);
+
+	d->data_ori_pos = de_getu16le(d->hdrpos+36);
+	de_dbg(c, "data pos: %"I64_FMT, d->data_ori_pos);
 	d->data_ori_len = c->infile->len - d->data_ori_pos;
-
-	if(d->screen_mode2!=0x33) goto done;
-	if(d->screen_mode!=3 && d->screen_mode!=0) goto done;
-
-	d->reported_w_in_chars = size_x;
-	d->reported_h_in_chars = size_y;
-	d->fmt_known = 1;
 
 done:
 	de_free(c, mem);
@@ -465,9 +625,9 @@ done:
 
 static void do_grabber_exe(deark *c, lctx *d, de_module_params *mparams)
 {
-	dbuf *tmpf = NULL;
-	i64 num_dcmpr_bytes_expected;
+	u8 img_fmt_supported = 0;
 
+	d->is_exe = 1;
 	fmtutil_collect_exe_info(c, c->infile, &d->ei);
 	d->edd.restrict_to_fmt = DE_SPECIALEXEFMT_GRABBER;
 	fmtutil_detect_specialexe(c, &d->ei, &d->edd);
@@ -477,28 +637,70 @@ static void do_grabber_exe(deark *c, lctx *d, de_module_params *mparams)
 	}
 
 	analyze_grabber_exe(c, d);
-	if(!d->fmt_known) {
+	if(!d->file_structure_supported) {
 		d->need_errmsg = 1;
 		goto done;
 	}
 
-	de_dbg(c, "data pos: %"I64_FMT, d->data_ori_pos);
+	if(d->screen_mode2==0x11) {
+		if(((d->screen_mode==4 || d->screen_mode==5) && d->reported_w==320 && d->reported_h==200) ||
+			(d->screen_mode==6 && d->reported_w==640 && d->reported_h==200))
+		{
+			img_fmt_supported = 1;
+		}
+	}
+	else if(d->screen_mode2==0x33) {
+		if(d->screen_mode<=0x03) {
+			img_fmt_supported = 1;
+			d->reported_w_in_chars = d->reported_w;
+			d->reported_h_in_chars = d->reported_h;
+		}
+	}
+	else if(d->screen_mode2==0x44) {
+		// EGA/VGA 2 or 16 color
+		switch(d->screen_mode) {
+			// TODO: I don't want to have to enumerate these modes, but I don't
+			// know how to tell whether an unknown mode is 2 color, or 16 color.
+			// There's two bytes at hdrpos+41 that seem relevant, but I
+			// couldn't make it work.
+		case 0x10: case 0x8d: case 0x8e: case 0x8f:
+		case 0x90: case 0x91: case 0x92: case 0xb7:
+			img_fmt_supported = 1;
+		}
+	}
+	else if(d->screen_mode2==0x55) {
+		// VGA 256-color
+		// I haven't found any images that don't work, so (for now) we won't
+		// whitelist ->screen_mode.
+		// Modes tested: 93 ae b0 b8 dc dd df ff
+		img_fmt_supported = 1;
+	}
 
-	num_dcmpr_bytes_expected = d->reported_h_in_chars*d->reported_w_in_chars*2;
-	tmpf = dbuf_create_membuf(c, num_dcmpr_bytes_expected, 0);
-	dbuf_enable_wbuffer(tmpf);
-	decompress_rletext_v370(c, d, tmpf, num_dcmpr_bytes_expected);
-	if(d->errflag) goto done;
+	if(!img_fmt_supported) {
+		d->need_errmsg = 1;
+		goto done;
+	}
 
-	rearrange_cmpr_text(c, d, tmpf);
+	if(!de_good_image_dimensions(c, d->reported_w, d->reported_h)) {
+		goto done;
+	}
 
-	d->data_f = tmpf;
-	d->data_f_pos = 0;
-	d->data_f_len = tmpf->len;
-	do_grabber_textmode(c, d);
+	if(d->screen_mode2==0x11) {
+		do_grabber_v370_cga(c, d);
+	}
+	else if(d->screen_mode2==0x33) {
+		do_grabber_v370_textmode(c, d);
+	}
+	else if(d->screen_mode2==0x44 || d->screen_mode2==0x55) {
+		do_grabber_v370_vga(c, d);
+	}
+	else {
+		d->need_errmsg = 1;
+		goto done;
+	}
 
 done:
-	dbuf_close(tmpf);
+	;
 }
 
 static void de_run_grabber(deark *c, de_module_params *mparams)
@@ -509,6 +711,7 @@ static void de_run_grabber(deark *c, de_module_params *mparams)
 	d = de_malloc(c, sizeof(lctx));
 	d->charctx = de_create_charctx(c, 0);
 	d->csctx.input_encoding = de_get_input_encoding(c, NULL, DE_ENCODING_CP437);
+	d->fi = de_finfo_create(c);
 
 	sig = (UI)de_getu16le(0);
 	if(sig==0x5a4d || sig==0x4d5a) {

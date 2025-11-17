@@ -259,6 +259,7 @@
     <ClCompile Include="..\..\modules\macbinary.c" />
     <ClCompile Include="..\..\modules\macpaint.c" />
     <ClCompile Include="..\..\modules\macrsrc.c" />
+    <ClCompile Include="..\..\modules\mahjong.c" />
     <ClCompile Include="..\..\modules\makichan.c" />
     <ClCompile Include="..\..\modules\mbk.c" />
     <ClCompile Include="..\..\modules\megapaint.c" />
@@ -360,6 +361,7 @@
     <ClCompile Include="..\..\src\fmtutil-lzh.c" />
     <ClCompile Include="..\..\src\fmtutil-lzw.c" />
     <ClCompile Include="..\..\src\fmtutil-miniz.c" />
+    <ClCompile Include="..\..\src\fmtutil-rle.c" />
     <ClCompile Include="..\..\src\fmtutil-zip.c" />
     <ClCompile Include="..\..\src\fmtutil.c" />
     <ClCompile Include="..\..\src\deark-font.c" />

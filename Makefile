@@ -78,7 +78,7 @@ OFILES_MODS_IO:=$(addprefix $(OBJDIR)/modules/,misc.o misc2.o misc3.o \
  id3.o ico.o iff.o ilbm.o insetpix.o iptc.o jbf.o jovianvi.o jpeg.o lha.o \
  j2c.o ogg.o olepropset.o iso9660.o macbinary.o macrsrc.o lzexe.o nufx.o \
  macpaint.o makichan.o mbk.o mmm.o mp3.o mscompress.o mac-arch.o \
- msp.o mmfw.o nokia.o os2bmp.o ole1.o os2pack.o \
+ mahjong.o msp.o mmfw.o nokia.o os2bmp.o ole1.o os2pack.o \
  officeart.o lbr.o megapaint.o nie.o installshld.o os2ea.o os2bootlogo.o)
 OFILES_MODS_PQ:=$(addprefix $(OBJDIR)/modules/,psd.o palmbitmap.o palmpdb.o \
  pcpaint.o pcx.o pff2.o pict.o pkfont.o png.o pnm.o portfolio.o printptnr.o \
@@ -97,7 +97,7 @@ OFILES_DEARK1:=$(addprefix $(OBJDIR)/src/,fmtutil-miniz.o deark-util.o \
  deark-dbuf.o deark-bitmap.o deark-char.o deark-font.o deark-ucstring.o \
  fmtutil.o fmtutil-cmpr.o fmtutil-advfile.o fmtutil-arch.o fmtutil-zip.o \
  fmtutil-fax.o fmtutil-lzh.o fmtutil-lzw.o fmtutil-huffman.o \
- fmtutil-exe.o fmtutil-lzah.o fmtutil-iff.o \
+ fmtutil-exe.o fmtutil-lzah.o fmtutil-rle.o fmtutil-iff.o \
  deark-user.o deark-unix.o deark-win.o)
 OFILES_DEARK2:=$(addprefix $(OBJDIR)/src/,deark-modules.o)
 OFILES_ALL:=$(OFILES_DEARK1) $(OFILES_DEARK2) $(OFILES_MODS) $(OBJDIR)/src/deark-cmd.o $(DEARK_RC_O)

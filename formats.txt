@@ -264,8 +264,8 @@ Deark -- Information about supported formats
 * GRABBER (module="grabber")
   Self-displaying DOS screen capture.
   - Most COM-based formats are supported (made by GRABBER up to v3.35).
-  - Support for EXE-based formats is very limited. Most text-mode formats made
-    by v3.70-3.98 (and some v6.30-6.60) are supported.
+  - Most EXE-based formats are supported, except for the early ones. Supported
+    versions are 3.70-3.98, 5.50-5.60, 6.30-6.60.
 
 * Graphic Workshop self-displaying picture (module="gws_exepic")
   - Supports the DOS EXE-based format.
@@ -409,6 +409,9 @@ Deark -- Information about supported formats
   Options
    -file2 <pal.cfg> - Read the palette from this file. Not expected to be used
     with TIS format, but allowed.
+
+* Mindjongg tileset (.ipg) (module="mindjongg")
+  - Extracts the embedded image files.
 
 * MAKIchan graphics (module="makichan")
   - Supports most 16- and 256-color .MAG images
