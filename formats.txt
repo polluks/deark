@@ -11,7 +11,8 @@ Deark -- Information about supported formats
 * ADEX .IMG (module="adex") (experimental)
 
 * Alias PIX, a.k.a. Vivid ray tracer bitmap (module="alias_pix")
-  - Truecolor only. Grayscale not supported.
+  - Not all files can be autodetected. You may need "-m alias_pix".
+  - Grayscale/matte images are not autodetected. Support is experimental.
 
 * Alpha Microsystems BMP (module="alphabmp") (experimental)
 
@@ -269,8 +270,9 @@ Deark -- Information about supported formats
 * GRABBER (module="grabber")
   Self-displaying DOS screen capture.
   - Most COM-based formats are supported (made by GRABBER up to v3.35).
-  - Most EXE-based formats are supported, except for the early ones. Supported
-    versions are 3.70-3.98, 5.50-5.60, 6.30-6.60.
+  - Most EXE-based formats are supported, except some early ones. Supported
+    versions are 3.70-3.98, 5.50-5.60, 6.30-6.60. Some modes are also supported
+    for v3.60, 6.01-6.20.
 
 * Graphic Workshop self-displaying picture (module="gws_exepic")
   - Supports the DOS EXE-based format.
@@ -1231,6 +1233,8 @@ in the readme file.)
      the start of the file (or to new_offset).
    -opt zip:combine - Instead of decoding, combine the files of a multi-segment
      archive into a single ZIP file. Use with "-mp". (experimental)
+   -opt zip:implodebug[=0] - Enable/disable workaround of the Implode "MML" bug
+     present in early versions of PKZIP. Default is to autodetect.
 
 * zlib (module="zlib")
   - Raw zlib files are uncompressed.

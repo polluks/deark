@@ -161,7 +161,7 @@ static void de_run_xpuzzle(deark *c, de_module_params *mparams)
 	// Read the bitmap
 	de_convert_image_paletted(c->infile, p, 8, hdr.w, pal, img, 0);
 
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -216,7 +216,7 @@ static void de_run_bob(deark *c, de_module_params *mparams)
 	// Read the bitmap
 	de_convert_image_paletted(c->infile, p, 8, w, pal, img, 0);
 
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -249,83 +249,146 @@ void de_module_bob(deark *c, struct deark_module_info *mi)
 // Also used by the Vivid ray tracer.
 // **************************************************************************
 
+static int decompress_alias_pix(deark *c, i64 bypp, dbuf *unc_pixels,
+	i64 nbytes_expected)
+{
+	u8 failure_flag = 0;
+	i64 nbytes_decompressed = 0;
+	i64 pos = 10;
+	u8 pixbuf[3] = {0, 0, 0};
+
+	while(1) {
+		i64 i;
+		i64 count;
+
+		if(nbytes_decompressed >= nbytes_expected) goto done;
+		if(pos >= c->infile->len) {
+			de_warn(c, "Unexpected end of image");
+			goto done;
+		}
+
+		count = de_getbyte_p(&pos);
+		if(count==0) {
+			failure_flag = 1;
+			goto done;
+		}
+		de_read(pixbuf, pos, bypp);
+		pos += bypp;
+		for(i=0; i<count; i++) {
+			dbuf_write(unc_pixels, pixbuf, bypp);
+		}
+		nbytes_decompressed += bypp*count;
+	}
+
+done:
+	dbuf_flush(unc_pixels);
+	if(failure_flag) {
+		de_err(c, "Decompression failed");
+		return 0;
+	}
+	return 1;
+}
+
 static void de_run_alias_pix(deark *c, de_module_params *mparams)
 {
 	de_bitmap *img = NULL;
 	i64 w, h;
-	i64 i;
 	i64 pos;
-	i64 firstline;
 	i64 depth;
-	i64 xpos, ypos;
-	i64 runlen;
-	u32 clr;
+	i64 unc_image_size;
+	i64 bypp;
+	dbuf *unc_pixels = NULL;
 
-	w = de_getu16be(0);
-	h = de_getu16be(2);
-	firstline = de_getu16be(4);
-	depth = de_getu16be(8);
-
+	pos = 0;
+	w = de_getu16be_p(&pos);
+	h = de_getu16be_p(&pos);
+	de_dbg_dimensions(c, w, h);
 	if(!de_good_image_dimensions(c, w, h)) goto done;
-	if(firstline >= h) goto done;
-	if(depth!=24) {
+
+	// The field@4 is sometimes given as "x offset", other times as
+	// "first scanline" (and other times as "unused").
+	// Maybe it's a difference between Alias PIX and Vivid formats?
+	// Anyway, we expect it to be 0, and we ignore it (and the field@6).
+	pos += 4;
+
+	depth = de_getu16be_p(&pos);
+	de_dbg(c, "depth: %d", (int)depth);
+	if(depth!=8 && depth!=24) {
 		de_err(c, "Unsupported image type");
 		goto done;
 	}
 
-	img = de_bitmap_create(c, w, h, 3);
+	bypp = depth/8;
+	unc_image_size = w*h*bypp;
+	unc_pixels = dbuf_create_membuf(c, unc_image_size, 0x1);
+	dbuf_enable_wbuffer(unc_pixels);
 
-	pos = 10;
-	xpos = 0;
-	// I don't know for sure what to do with the "first scanline" field, in the
-	// unlikely event it is not 0. The documentation doesn't say.
-	ypos = firstline;
-	while(1) {
-		if(pos+4 > c->infile->len) {
-			break; // EOF
-		}
-		runlen = (i64)de_getbyte(pos);
-		clr = dbuf_getRGB(c->infile, pos+1, DE_GETRGBFLAG_BGR);
-		pos+=4;
+	if(!decompress_alias_pix(c, bypp, unc_pixels, unc_image_size)) {
+		goto done;
+	}
+	de_dbg(c, "[decompressed to %"I64_FMT" bytes]", unc_pixels->len);
 
-		for(i=0; i<runlen; i++) {
-			de_bitmap_setpixel_rgb(img, xpos, ypos, clr);
-			xpos++; // Runs are not allowed to span rows
-		}
+	if(depth==8) {
+		de_color pal[256];
 
-		if(xpos >= w) {
-			xpos=0;
-			ypos++;
-		}
+		de_make_grayscale_palette(pal, 256, 0);
+		img = de_bitmap_create(c, w, h, 1);
+		de_convert_image_paletted(unc_pixels, 0, 8, w, pal, img, 0);
+	}
+	else {
+		img = de_bitmap_create(c, w, h, 3);
+		de_convert_image_rgb(unc_pixels, 0, w*3, 3, img, DE_GETRGBFLAG_BGR);
 	}
 
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
+
 done:
 	de_bitmap_destroy(img);
+	dbuf_close(unc_pixels);
+}
+
+// Rows are supposed to be compressed independently.
+// We check that no run crosses over the end of the first row.
+static int aliaspix_valid_first_row(deark *c, UI w, UI bypp)
+{
+	i64 pos = 10;
+	UI pixpos = 0;
+	int retval = 0;
+
+	while(1) {
+		UI count;
+
+		if(pixpos==w) { retval = 1; goto done; }
+		if(pixpos>w) goto done;
+		count = (UI)de_getbyte_p(&pos);
+		if(count==0) goto done;
+		// TODO? We could also do some sanity checks if there are two
+		// consecutive runs of the same color, that should have been
+		// combined into one.
+		pos += (i64)bypp;
+		pixpos += count;
+	}
+done:
+	return retval;
 }
 
 static int de_identify_alias_pix(deark *c)
 {
-	i64 w, h, firstline, lastline, depth;
+	UI w, h, field4, field6, depth;
 
-	if(!de_input_file_has_ext(c, "img") &&
-		!de_input_file_has_ext(c, "als") &&
-		!de_input_file_has_ext(c, "pix"))
-	{
+	depth = (UI)de_getu16be(8);
+	if(depth!=24) return 0;
+	w = (UI)de_getu16be(0);
+	if(w<1 || w>2048) return 0;
+	h = (UI)de_getu16be(2);
+	if(h<1 || h>2048) return 0;
+	field4 = (UI)de_getu16be(4);
+	if(field4!=0) return 0;
+	field6 = (UI)de_getu16be(6);
+	if(field6!=0 && field6!=(h-1) && field6!=h) return 0;
+	if(!aliaspix_valid_first_row(c, w, depth/8)) {
 		return 0;
 	}
-
-	w = de_getu16be(0);
-	h = de_getu16be(2);
-	firstline = de_getu16be(4);
-	lastline = de_getu16be(6);
-	depth = de_getu16be(8);
-
-	if(depth!=24) return 0;
-	if(firstline>lastline) return 0;
-	// 'lastline' should usually be h-1, but XnView apparently sets it to h.
-	if(firstline>h-1 || lastline>h) return 0;
-	if(!de_good_image_dimensions_noerr(c, w, h)) return 0;
 	return 30;
 }
 
@@ -389,7 +452,7 @@ static void de_run_applevol(deark *c, de_module_params *mparams)
 		}
 	}
 
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -632,7 +695,7 @@ static void de_run_lss16(deark *c, de_module_params *mparams)
 		}
 	}
 
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 done:
 	de_bitmap_destroy(img);
 	de_free(c, d);
@@ -927,7 +990,7 @@ static void de_run_ybm(deark *c, de_module_params *mparams)
 				DE_CVTF_WHITEISZERO|DE_CVTF_LSBFIRST|DE_CVTF_ONLYWHITE);
 		}
 	}
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, DE_CREATEFLAG_IS_BWIMG);
 
 done:
 	de_bitmap_destroy(img);
@@ -985,7 +1048,7 @@ static void de_run_olpc565(deark *c, de_module_params *mparams)
 			de_bitmap_setpixel_rgb(img, i, j, clr);
 		}
 	}
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -1040,7 +1103,7 @@ static void de_run_iim(deark *c, de_module_params *mparams)
 			de_bitmap_setpixel_rgb(img, i, j, clr);
 		}
 	}
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -1135,7 +1198,7 @@ static void de_run_pm_xv(deark *c, de_module_params *mparams)
 			}
 		}
 	}
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -1362,7 +1425,7 @@ static void de_run_hsiraw(deark *c, de_module_params *mparams)
 		de_convert_image_paletted(c->infile, pos, 8, w, pal, img, 0);
 	}
 
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -1413,7 +1476,7 @@ static void de_run_qdv(deark *c, de_module_params *mparams)
 
 	img = de_bitmap_create(c, w, h, 3);
 	de_convert_image_paletted(c->infile, pos, 8, w, pal, img, 0);
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -1515,7 +1578,7 @@ static void de_run_vitec(deark *c, de_module_params *mparams)
 		}
 	}
 
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -1624,7 +1687,7 @@ static void de_run_lumena_cel(deark *c, de_module_params *mparams)
 	}
 
 	de_bitmap_optimize_alpha(img, 0x3);
-	de_bitmap_write_to_fileOLD(img, NULL, DE_CREATEFLAG_FLIP_IMAGE);
+	de_bitmap_write_to_file(img, NULL, DE_CREATEFLAG_FLIP_IMAGE);
 
 done:
 	de_bitmap_destroy(img);
@@ -1703,7 +1766,7 @@ static void de_run_deskmate_pnt(deark *c, de_module_params *mparams)
 
 	img = de_bitmap_create(c, w, h, 3);
 	de_convert_image_paletted(unc_pixels, 0, 4, rowspan, pal, img, 0);
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 	dbuf_close(unc_pixels);
 	de_bitmap_destroy(img);
@@ -1777,7 +1840,7 @@ static void de_run_mdesk_icn(deark *c, de_module_params *mparams)
 	img = de_bitmap_create(c, 32, 32, 3);
 	de_convert_image_paletted(c->infile, 3, 4, 16, pal, img, 0);
 	de_bitmap_transpose(img);
-	de_bitmap_write_to_fileOLD(img, NULL, 0);
+	de_bitmap_write_to_file(img, NULL, 0);
 	de_bitmap_destroy(img);
 }
 
@@ -1847,7 +1910,7 @@ static void de_run_animator_pic(deark *c, de_module_params *mparams)
 	fi->density.ydens = 200.0;
 	img = de_bitmap_create(c, w, h, 3);
 	de_convert_image_paletted(c->infile, pos, 8, w, pal, img, 0);;
-	de_bitmap_write_to_file_finfoOLD(img, fi, 0);
+	de_bitmap_write_to_file_finfo(img, fi, 0);
 
 done:
 	de_bitmap_destroy(img);
@@ -1918,7 +1981,7 @@ static void de_run_dgi(deark *c, de_module_params *mparams)
 	fi->density.xdens = 240;
 	fi->density.ydens = 200;
 
-	de_bitmap_write_to_file_finfoOLD(img, fi, 0);
+	de_bitmap_write_to_file_finfo(img, fi, 0);
 
 	dbuf_close(imgbuf);
 	de_bitmap_destroy(img);
@@ -2117,7 +2180,7 @@ static void do_lotus_mscr_rle(deark *c, struct lotus_mscr_ctx *d)
 	pal[0] = DE_STOCKCOLOR_WHITE;
 	pal[1] = DE_STOCKCOLOR_BLACK;
 	de_convert_image_paletted(unc_pixels, 0, 8, d->w, pal, img, 0);
-	de_bitmap_write_to_file_finfoOLD(img, d->fi, 0);
+	de_bitmap_write_to_file_finfo(img, d->fi, DE_CREATEFLAG_IS_BWIMG);
 
 	dbuf_close(unc_pixels);
 	de_bitmap_destroy(img);
