@@ -563,7 +563,7 @@ Deark -- Information about supported formats
   Options
    -opt pixfolio:undelete - Also extract deleted images.
 
-* Picture Catalog (Spinnaker) (module="pic_cat_sp")
+* Picture Catalog (.cat) (Spinnaker) (module="pic_cat_sp")
   An obscure IFF-like format used by some Spinnaker Windows apps.
 
 * PIXIT/pix320 (module="pixit")
@@ -703,6 +703,9 @@ Deark -- Information about supported formats
 
 * Syberia texture (.syj) (module="syberia_syj")
   - Convert abbreviated JPEG file to JPEG.
+
+* Template Catalog (.tct) (Spinnaker) (module="tplt_cat_sp")
+  Similar format to Spinnaker Picture Catalog.
 
 * TGA (Targa) (module="tga")
   Options
