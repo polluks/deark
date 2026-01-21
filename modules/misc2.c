@@ -2012,36 +2012,63 @@ void de_module_dgi(deark *c, struct deark_module_info *mi)
 // CompuServe RLE
 // **************************************************************************
 
-static int get_cserve_rle_fmt(deark *c)
+static u8 get_cserve_rle_fmt(deark *c, u8 strictmode)
 {
-	u8 buf[3];
+	u8 buf[64];
+	u8 fmt = 0;
+	UI k;
 
 	de_read(buf, 0, 3);
-	if(buf[0]!=0x1b || buf[1]!=0x47) return 0;
-	if(buf[2]==0x4d) return 1;
-	if(buf[2]==0x48) return 2;
-	return 0;
+	if(buf[0]!=0x1b || buf[1]!='G') return 0;
+	if(buf[2]=='M') fmt = 1;
+	else if(buf[2]=='H') fmt = 2;
+	else if(buf[2]=='C') {
+		// Ref: http://cd.textfiles.com/gigabytesw/010a/crle.zip
+		fmt = 3;
+	}
+	if(!fmt) return 0;
+	if(!strictmode) return fmt;
+	de_read(buf, 3, 64);
+	for(k=0; k<64; k++) {
+		if(buf[k]<0x20 || buf[k]>0x7f) return 0;
+		if(fmt==3) {
+			if((k%2) && buf[k]>0x23) {
+				// Invalid color
+				return 0;
+			}
+		}
+		else {
+			if(k>0 && buf[k]==0x20 && buf[k-1]==0x20) {
+				// Shouldn't have two 0-length runs in a row
+				return 0;
+			}
+		}
+	}
+	return fmt;
 }
 
 static void de_run_cserve_rle(deark *c, de_module_params *mparams)
 {
-	int fmt;
+	u8 fmt;
+	const char *name;
 	i64 w, expected_h, actual_h;
 	i64 max_npixels;
 	i64 npixels_expected;
 	i64 npixels_found;
 	i64 pos;
+	i64 count;
+	u8 parity;
 	u8 next_color;
 	dbuf *unc_pixels = NULL;
 	de_bitmap *img = NULL;
 	de_color pal[256];
 
-	fmt = get_cserve_rle_fmt(c);
+	fmt = get_cserve_rle_fmt(c, 0);
 	if(fmt==1) {
 		w = 128;
 		expected_h = 96;
 	}
-	else if(fmt==2) {
+	else if(fmt==2 || fmt==3) {
 		w = 256;
 		expected_h = 192;
 	}
@@ -2049,6 +2076,11 @@ static void de_run_cserve_rle(deark *c, de_module_params *mparams)
 		de_err(c, "Not a CompuServe RLE file");
 		goto done;
 	}
+
+	if(fmt==1) name = "med. res.";
+	else if(fmt==3) name = "color";
+	else name = "high res.";
+	de_declare_fmtf(c, "CompuServe RLE, %s", name);
 
 	de_dbg(c, "width: %"I64_FMT, w);
 	npixels_expected = w*expected_h;
@@ -2059,6 +2091,8 @@ static void de_run_cserve_rle(deark *c, de_module_params *mparams)
 	pos = 3;
 	npixels_found = 0;
 	next_color = 1; // 1=black, 2=white, 0=unset
+	parity = 0;
+	count = 0;
 	while(1) {
 		u8 x;
 
@@ -2069,12 +2103,23 @@ static void de_run_cserve_rle(deark *c, de_module_params *mparams)
 
 		x = de_getbyte_p(&pos);
 		if(x>=0x20) {
-			i64 count;
-
-			count = (i64)x - 0x20;
+			if(parity==0) {
+				count = (i64)x - 0x20;
+				if(fmt==3) {
+					parity = !parity;
+					continue;
+				}
+			}
+			if(parity==1 && fmt==3) {
+				// (0x1f instead of 0x20 because our palette is offset by 1.)
+				next_color = x - 0x1f;
+				parity = !parity;
+			}
 			dbuf_write_run(unc_pixels, next_color, count);
 			npixels_found += count;
-			next_color = (next_color==1)?2:1;
+			if(fmt!=3) {
+				next_color = (next_color==1)?2:1;
+			}
 		}
 		else if(x==0x1b) {
 			break;
@@ -2097,11 +2142,17 @@ static void de_run_cserve_rle(deark *c, de_module_params *mparams)
 	de_zeromem(pal, sizeof(pal));
 	// Images that don't end cleanly are common enough that we go to
 	// the trouble of making missing pixels a special color.
-	pal[0] = DE_MAKE_RGB(255,0,255);
-	pal[1] = DE_STOCKCOLOR_BLACK;
-	pal[2] = DE_STOCKCOLOR_WHITE;
+	if(fmt==3) {
+		pal[0] = DE_MAKE_RGB(255,128,128);
+		de_copy_std_palette(DE_PALID_CGA, 3, 0, &pal[1], 4, 0);
+	}
+	else {
+		pal[0] = DE_MAKE_RGB(255,0,255);
+		pal[1] = DE_STOCKCOLOR_BLACK;
+		pal[2] = DE_STOCKCOLOR_WHITE;
+	}
 	de_convert_image_paletted(unc_pixels, 0, 8, w, pal, img, 0);
-	de_bitmap_write_to_file(img, NULL, DE_CREATEFLAG_OPT_IMAGE);
+	de_bitmap_write_to_file(img, NULL, 0);
 
 done:
 	dbuf_close(unc_pixels);
@@ -2110,11 +2161,16 @@ done:
 
 static int de_identify_cserve_rle(deark *c)
 {
-	int x;
+	u8 has_ext;
+	u8 fmt;
 
-	x = get_cserve_rle_fmt(c);
-	if(x==0) return 0;
-	return 85;
+	fmt = get_cserve_rle_fmt(c, 1);
+	if(fmt==0) return 0;
+	has_ext = de_input_file_has_ext(c, "rle");
+	if(fmt==3) {
+		return has_ext?60:0;
+	}
+	return has_ext?92:32;
 }
 
 void de_module_cserve_rle(deark *c, struct deark_module_info *mi)
