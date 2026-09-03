@@ -42,6 +42,27 @@ struct ver_info_struct {
 	char pklver_str[40];
 };
 
+
+#define PKL_DVER_UNKNOWN  0
+#define PKL_DVER_MAYBETA  10005
+#define PKL_DVER_JULBETA  10007
+#define PKL_DVER_100      10050
+#define PKL_DVER_103      10350
+#define PKL_DVER_105      10550
+#define PKL_DVER_111      11150
+#define PKL_DVER_112      11250
+#define PKL_DVER_113      11350
+#define PKL_DVER_114      11450
+#define PKL_DVER_115      11550
+#define PKL_DVER_150      15050
+#define PKL_DVER_201      20150
+struct verdetect_struct {
+	u8 isset;
+	u8 special_version;
+	UI ver_min;
+	UI ver_max;
+};
+
 struct footer_struct {
 	i64 regSS;
 	i64 regSP;
@@ -58,6 +79,8 @@ typedef struct localctx_pklite {
 
 	u8 is_com;
 	u8 is_may90_beta;
+	u8 possible_beta_filesize_bug;
+	u8 is_jul90_beta;
 	u8 data_before_decoder;
 	u8 load_high;
 	u8 has_psp_sig;
@@ -126,6 +149,10 @@ typedef struct localctx_pklite {
 #define DECOMPR_CLASS_COM_100       241
 	u8 decompr_class;
 
+	u8 copier_byte17;
+	u8 copier_byte23;
+	u8 decompr_byte9;
+
 	i64 cmpr_data_endpos; // = reloc_tbl_pos
 	i64 reloc_tbl_endpos;
 	i64 cmpr_reloc_tbl_len;
@@ -140,6 +167,7 @@ typedef struct localctx_pklite {
 	dbuf *dcmpr_code;
 
 	struct ver_info_struct ver_reported;
+	struct verdetect_struct verdetect;
 
 	// A copy of the bytes at the EXE entry point, generally up to but not
 	// including the compressed data. The most we expect to need is about 800,
@@ -159,6 +187,50 @@ struct decompr_internal_state {
 	struct fmtutil_huffman_decoder *lengths_tree;
 	struct fmtutil_huffman_decoder *offsets_tree;
 };
+
+// flags: 0x1 = "weak" mode: If out of range, disregard.
+static void pkl_set_detver_range(lctx *d, UI minv, UI maxv, UI flags)
+{
+	if(d->verdetect.special_version) goto done;
+	if(minv>maxv) {
+		if(flags&0x1) goto done;
+		d->verdetect.isset = 1;
+		d->verdetect.special_version = 1;
+		goto done;
+	}
+
+	if(!d->verdetect.isset) {
+		d->verdetect.isset = 1;
+		d->verdetect.ver_min = minv;
+		d->verdetect.ver_max = maxv;
+	}
+
+	if((minv>d->verdetect.ver_max) || (maxv<d->verdetect.ver_min)) {
+		if(flags&0x1) goto done;
+		d->verdetect.special_version = 1;
+		goto done;
+	}
+
+	if(minv>d->verdetect.ver_min) {
+		d->verdetect.ver_min = minv;
+	}
+	if(maxv<d->verdetect.ver_max) {
+		d->verdetect.ver_max = maxv;
+	}
+done:
+	;
+}
+
+static void pkl_set_detver(lctx *d, UI v, UI flags)
+{
+	pkl_set_detver_range(d, v, v, flags);
+}
+
+static void pkl_set_detver_special(lctx *d)
+{
+	d->verdetect.isset = 1;
+	d->verdetect.special_version = 1;
+}
 
 #define pkl_memmatch de_memmatch
 
@@ -540,6 +612,9 @@ static void analyze_copier(deark *c, lctx *d)
 	de_dbg(c, "copier at ep+%u", (UI)pos);
 	de_dbg_indent(c, 1);
 
+	d->copier_byte17 = d->epbytes[pos+17];
+	d->copier_byte23 = d->epbytes[pos+23];
+
 	if(pkl_search_match(d->epbytes, EPBYTES_LEN,
 		pos, pos+75,
 		(const u8*)"\xb9??\x33\xff\x57\xbe??\xfc\xf3\xa5", 12, '?', 0, &foundpos))
@@ -645,6 +720,8 @@ static void analyze_decompressor(deark *c, lctx *d)
 
 	de_dbg(c, "decompressor at ep+%u", (UI)pos);
 	de_dbg_indent(c, 1);
+
+	d->decompr_byte9 = d->epbytes[pos+9];
 
 	if(pkl_memmatch(&d->epbytes[pos],
 		(const u8*)"\xfd\x8c\xdb\x53\x83\xc3", 6, '?', 0))
@@ -1551,6 +1628,23 @@ static void find_min_mem_needed(deark *c, lctx *d, i64 *pminmem)
 	}
 }
 
+// Must be called after acquire_new_exe_header().
+static void detect_beta_filesize_bug(deark *c, lctx *d) {
+	// The "5-29-90" beta has a bug when the file size is an exact multiple of
+	// 512 bytes. Such a buggy file is probably very rare, as there's a good
+	// chance it won't run properly. But in most cases, it can be decompressed
+	// successfully... *provided* we don't mess it up by trying to be helpful
+	// by detecting and dealing with the inconsistency.
+	if(d->is_may90_beta) {
+		UI lenfinal;
+
+		lenfinal = (UI)dbuf_getu16le(d->hdr_for_dcmpr_file, 2);
+		if(lenfinal==0) {
+			d->possible_beta_filesize_bug = 1;
+		}
+	}
+}
+
 static void do_write_data_only(deark *c, lctx *d)
 {
 	if(!d->dcmpr_code) return;
@@ -1562,7 +1656,6 @@ static void do_write_dcmpr(deark *c, lctx *d)
 {
 	dbuf *outf = NULL;
 	i64 amt_to_copy;
-	u8 possible_beta_filesize_bug = 0;
 	u8 copy_overlay = 0;
 
 	if(d->errflag || !d->guest_ei || !d->hdr_for_dcmpr_file || !d->dcmpr_code ||
@@ -1575,20 +1668,6 @@ static void do_write_dcmpr(deark *c, lctx *d)
 
 	outf = dbuf_create_output_file(c, "exe", NULL, 0);
 	d->wrote_exe = 1;
-
-	// The "5-29-90" beta has a bug when the file size is an exact multiple of
-	// 512 bytes. Such a buggy file is probably very rare, as there's a good
-	// chance it won't run properly. But in most cases, it can be decompressed
-	// successfully... *provided* we don't mess it up by trying to be helpful
-	// by detecting and dealing with the inconsistency.
-	if(d->is_may90_beta) {
-		UI lenfinal;
-
-		lenfinal = (UI)dbuf_getu16le(d->hdr_for_dcmpr_file, 2);
-		if(lenfinal==0) {
-			possible_beta_filesize_bug = 1;
-		}
-	}
 
 	// Write the original header, up to the relocation table
 	amt_to_copy = de_min_int(d->hdr_for_dcmpr_file->len, d->guest_ei->reloc_table_pos);
@@ -1608,7 +1687,7 @@ static void do_write_dcmpr(deark *c, lctx *d)
 
 	// "Overlay" segment
 	if(d->host_ei->overlay_len>0) {
-		if(possible_beta_filesize_bug) {
+		if(d->possible_beta_filesize_bug) {
 			copy_overlay = 1;
 		}
 		else if(outf->len == d->guest_ei->end_of_dos_code) {
@@ -1782,6 +1861,231 @@ static void reconstruct_header(deark *c, lctx *d)
 }
 
 #if PKL_DBG_MINMAXALLOC
+
+struct minmax1_ctx {
+	i64 guest_filesize;
+	i64 guest_ucodesize;
+	i64 guest_MINALLOC;
+	i64 guest_MAXALLOC;
+	i64 guest_unumblocks;
+
+	i64 host_ucodesize;
+	i64 host_numblocks;
+	i64 host_MINALLOC;
+	i64 host_MAXALLOC;
+
+	i64 pred_MINALLOC_nrm;
+	i64 pred_MINALLOC_min;
+	i64 pred_MINALLOC;
+
+	i64 pred_AX_nrm;
+	i64 pred_AX_min;
+	i64 pred_AX1, pred_AX;
+
+	i64 pred_MAXALLOC;
+
+	i64 intermed_cdszdiff;
+	i64 intermed_cmprreloc;
+
+	const char *maxmemalgstr;
+	const char *axalgstr;
+	u8 minmem_toobig_flag;
+	i64 ax_adj;
+};
+
+static void f1_mina_nrmMAY(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	i64 npad;
+	i64 guest_filesize_adj;
+
+	// This formula looks dubious, or at least it looks like it should be
+	// possible to simplify it. But I haven't found any exceptions to it,
+	// and haven't managed to simplify it.
+
+	guest_filesize_adj = m1->guest_filesize;
+	if(d->possible_beta_filesize_bug) {
+		guest_filesize_adj -= 512;
+	}
+
+	// Because the decompressor is 16-byte aligned, and ends at
+	// end_of_dos_code, I expect npad to only have a few possible values:
+	//  12 for small-cmpr
+	//  8  for large-cmpr
+	//  13 for small-cmpr load-high
+	//  15 for large-cmpr load-high
+	// (So I can't fully test the formula.)
+	npad = d->host_ei->end_of_dos_code % 16;
+	if(npad != 0) {
+		npad = 16 - npad;
+	}
+
+	m1->pred_MINALLOC_nrm = m1->guest_MINALLOC
+		+ (guest_filesize_adj+npad)/16
+		- (d->host_ei->end_of_dos_code/16);
+}
+
+static void f1_mina_nrm100(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_MINALLOC_nrm = m1->guest_MINALLOC
+	+ (m1->guest_ucodesize)/16
+	- (m1->host_ucodesize)/16;
+}
+
+static void f1_mina_nrm103(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_MINALLOC_nrm = m1->guest_MINALLOC
+		+ (m1->guest_ucodesize + 15)/16
+		- (m1->host_ucodesize + 15)/16;
+}
+
+static void f1_mina_nrm112(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_MINALLOC_nrm = m1->guest_MINALLOC
+		+ m1->intermed_cdszdiff;
+}
+
+static void f1_mina_min103(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_MINALLOC_min =
+		(m1->guest_ucodesize + 15)/16
+		- (m1->host_ucodesize + 15)/16
+		+ m1->intermed_cmprreloc
+		+ 256;
+}
+
+static void f1_mina_min112(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_MINALLOC_min = m1->intermed_cdszdiff + m1->intermed_cmprreloc + 0x140;
+}
+
+static void f1_ax_nrm103(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_AX_nrm = m1->guest_MINALLOC + ((m1->guest_ucodesize + 0x0f)>>4);
+}
+
+static void f1_ax_nrm112(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_AX_nrm = m1->guest_MINALLOC - 0x10 + ((m1->guest_ucodesize + 0x0f)>>4);
+}
+
+static void f1_ax_min100(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_AX_min = ((d->guest_ei->end_of_dos_code+15)>>4) + 0x110;
+}
+
+static void f1_ax_min103(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_AX_min = ((m1->guest_ucodesize+15)>>4)
+		+ m1->intermed_cmprreloc + 0x100;
+}
+
+static void f1_ax_min112(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	m1->pred_AX_min = ((m1->guest_ucodesize+15)>>4)
+		+ m1->intermed_cmprreloc + 0x130;
+}
+
+static void f1_maxa_100(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	if(m1->guest_MAXALLOC < m1->pred_MINALLOC) {
+		m1->maxmemalgstr = "min";
+		m1->pred_MAXALLOC = m1->pred_MINALLOC;
+	}
+	else {
+		m1->maxmemalgstr = "copied";
+		m1->pred_MAXALLOC = m1->guest_MAXALLOC;
+	}
+}
+
+static void f1_maxa_112(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	i64 tmp;
+
+	if(m1->minmem_toobig_flag) {
+		m1->maxmemalgstr = "minmemtoobig";
+		m1->pred_MAXALLOC = 0xffff;
+		return;
+	}
+
+	if(m1->guest_MAXALLOC==0xffff) {
+		m1->maxmemalgstr = "copied";
+		m1->pred_MAXALLOC = 0xffff;
+		return;
+	}
+
+	tmp = m1->guest_MAXALLOC + (m1->pred_MINALLOC - m1->guest_MINALLOC);
+	if(tmp<0) tmp = 0;
+	// There is a bug in PKLITE v1.12+. If guest_MAXALLOC < 0xffff,
+	// and the calculated host MAXALLOC is > 0xffff, it will wrap around to a
+	// way-too-small number.
+	// Easily reproduced by setting guest MAXALLOC to, say, 0xfffe.
+	tmp = tmp % 65536;
+
+	if(tmp>=0x8000) {
+		m1->maxmemalgstr = "max";
+		m1->pred_MAXALLOC = 0xffff;
+		return;
+	}
+
+	if(m1->ax_adj>0) {
+		// The >=0x8000 test happens before this. Therefore, the final
+		// MAXMEM can be up to 0x804f.
+		m1->maxmemalgstr = "nrm80";
+		tmp = tmp + 80;
+	}
+	else {
+		m1->maxmemalgstr = "nrm";
+	}
+
+	m1->pred_MAXALLOC = tmp;
+}
+
+// Sets m1->pred_AX1
+static void f1_ax_finInternal(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	if(m1->pred_AX_min == m1->pred_AX_nrm) {
+		m1->pred_AX1 = m1->pred_AX_nrm;
+		m1->axalgstr = "nrm=min";
+	}
+	else if(m1->pred_AX_min > m1->pred_AX_nrm) {
+		m1->pred_AX1 = m1->pred_AX_min;
+		m1->axalgstr = "min";
+	}
+	else {
+		m1->pred_AX1 = m1->pred_AX_nrm;
+		m1->axalgstr = "nrm";
+	}
+}
+
+// For most relevant versions up to 1.13.
+static void f1_ax_finSTD(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	f1_ax_finInternal(c, d, m1);
+	m1->pred_AX = m1->pred_AX1;
+}
+
+// For v1.14+.
+static void f1_ax_fin114(deark *c, lctx *d, struct minmax1_ctx *m1)
+{
+	i64 stack_top;
+	i64 axdiff;
+
+	f1_ax_finInternal(c, d, m1);
+
+	stack_top = d->footer.regSS*16 + d->footer.regSP;
+	axdiff = m1->pred_AX1*16-stack_top;
+
+	de_dbg(c, "pred. AX1           : 0x%04x", (UI)m1->pred_AX1);
+	de_dbg(c, "AX1/stack diff:     : %+"I64_FMT, axdiff);
+
+	if(axdiff>=1 && axdiff<=1264) {
+		m1->ax_adj = 80;
+	}
+
+	de_dbg(c, "AX1 adjustment:     : %+"I64_FMT, m1->ax_adj);
+	m1->pred_AX = m1->pred_AX1 + m1->ax_adj;
+}
+
 // This code is part of a project to figure out how best to reconstruct the
 // min-alloc and max-alloc fields in a decompressed EXE file, when the
 // compressed file lacks a copy of them. It doesn't necessarily belong in
@@ -1795,41 +2099,23 @@ static void reconstruct_header(deark *c, lctx *d)
 // true for all versions.
 static void temp_minmaxalloc(deark *c, lctx *d)
 {
-	i64 guest_ucodesize;
-	i64 guest_MINALLOC;
-	i64 guest_MAXALLOC;
-	i64 guest_unumblocks;
-	i64 host_ucodesize;
-	i64 host_numblocks;
-	i64 host_MINALLOC;
-	i64 host_MAXALLOC;
-	i64 pred_MINALLOC_nrm;
-	i64 pred_MINALLOC_min;
-	i64 pred_MINALLOC;
-	i64 pred_AX_nrm;
-	i64 pred_AX_min;
-	i64 pred_AX1, pred_AX;
-	u8 calc_AX80 = 0;
-	u8 minmem_toobig_flag = 0;
-	i64 intermed_cdszdiff;
-	i64 intermed_cmprreloc;
-	i64 pred_MAXALLOC = 0;
-	const char *maxmemalgstr = "?";
+	struct minmax1_ctx *m1 = NULL;
+	u8 flag1;
 	const char *mmalgstr;
-	const char *axalgstr;
 	const char *verdict;
 	UI ver;
-	i64 ax_adj = 0;
-	//UI subver = 0;
 	int saved_indent_level;
 
 	de_dbg_indent_save(c, &saved_indent_level);
+
+	m1 = de_malloc(c, sizeof(struct minmax1_ctx));
+	m1->maxmemalgstr = "?";
+	m1->axalgstr = "?";
 
 	// TODO: Need a more trustworthy version number.
 	ver = d->ver_reported.ver_num;
 
 	if(!d->using_copy_of_exe_header) goto done;
-	if(!d->ax_val) goto done;
 	if(ver==0x0100 || ver==0x0103 || ver==0x0105 ||
 		ver==0x010b || (ver>=0x010c && ver<=0x0201))
 	{
@@ -1842,238 +2128,265 @@ static void temp_minmaxalloc(deark *c, lctx *d)
 	de_dbg(c, "[MIN/MAX alloc analysis]");
 	de_dbg_indent(c, 1);
 
-	guest_ucodesize = d->guest_ei->end_of_dos_code - d->guest_ei->start_of_dos_code;
-	host_ucodesize = d->host_ei->end_of_dos_code - d->host_ei->start_of_dos_code;
+	de_dbg(c, "is may beta         : %u", (UI)d->is_may90_beta);
+	de_dbg(c, "is jul beta         : %u", (UI)d->is_jul90_beta);
+	if(d->is_may90_beta) {
+		de_dbg(c, "load high           : %u", (UI)d->load_high);
+		de_dbg(c, "beta filesize bug   : %u", (UI)d->possible_beta_filesize_bug);
+	}
 
-	guest_unumblocks = dbuf_getu16le(d->hdr_for_dcmpr_file, 4);
-	guest_MINALLOC = dbuf_getu16le(d->hdr_for_dcmpr_file, 10);
-	guest_MAXALLOC = dbuf_getu16le(d->hdr_for_dcmpr_file, 12);
+	m1->guest_ucodesize = d->guest_ei->end_of_dos_code - d->guest_ei->start_of_dos_code;
+	m1->host_ucodesize = d->host_ei->end_of_dos_code - d->host_ei->start_of_dos_code;
+	m1->guest_filesize = d->guest_ei->end_of_dos_code + d->host_ei->overlay_len;
 
-	host_numblocks = de_getu16le(4);
-	host_MINALLOC = de_getu16le(10);
-	host_MAXALLOC = de_getu16le(12);
+	m1->guest_unumblocks = dbuf_getu16le(d->hdr_for_dcmpr_file, 4);
+	m1->guest_MINALLOC = dbuf_getu16le(d->hdr_for_dcmpr_file, 10);
+	m1->guest_MAXALLOC = dbuf_getu16le(d->hdr_for_dcmpr_file, 12);
 
-	de_dbg(c, "guest u.codesize    : 0x%x = %"I64_FMT, (UI)guest_ucodesize,
-		guest_ucodesize);
+	m1->host_numblocks = de_getu16le(4);
+	m1->host_MINALLOC = de_getu16le(10);
+	m1->host_MAXALLOC = de_getu16le(12);
+
+	de_dbg(c, "host overlay        : %"I64_FMT, d->host_ei->overlay_len);
+	de_dbg(c, "guest u.codesize    : 0x%x = %"I64_FMT, (UI)m1->guest_ucodesize,
+		m1->guest_ucodesize);
+	de_dbg(c, "host u.codesize     : 0x%x = %"I64_FMT, (UI)m1->host_ucodesize,
+		m1->host_ucodesize);
 	de_dbg(c, "guest SS:SP         : 0x%04x:%04x",
 		(UI)d->footer.regSS, (UI)d->footer.regSP);
+	de_dbg(c, "est. guest filesize : %"I64_FMT, m1->guest_filesize);
 
 	de_dbg(c, "cmpr reloc tbl len  : %"I64_FMT, d->cmpr_reloc_tbl_len);
 
-	de_dbg(c, "guest MINALLOC      : 0x%04x", (UI)guest_MINALLOC);
-	de_dbg(c, "host MINALLOC       : 0x%04x", (UI)host_MINALLOC);
-	de_dbg(c, "guest MAXALLOC      : 0x%04x", (UI)guest_MAXALLOC);
+	de_dbg(c, "guest MINALLOC      : 0x%04x", (UI)m1->guest_MINALLOC);
+	de_dbg(c, "host MINALLOC       : 0x%04x", (UI)m1->host_MINALLOC);
+	de_dbg(c, "guest MAXALLOC      : 0x%04x", (UI)m1->guest_MAXALLOC);
 
-	de_dbg(c, "host MAXALLOC       : 0x%04x%s", (UI)host_MAXALLOC,
-		(host_MAXALLOC<host_MINALLOC ? " (!?)":""));
+	flag1 = 0;
+	if(m1->host_MAXALLOC<m1->host_MINALLOC && !d->load_high) {
+		flag1 = 1;
+	}
+	de_dbg(c, "host MAXALLOC       : 0x%04x%s", (UI)m1->host_MAXALLOC,
+		(flag1 ? " (!?)":""));
 
-	intermed_cdszdiff = (guest_unumblocks*32 - d->guest_ei->start_of_dos_code/16)
-		- (host_numblocks*32 - d->host_ei->start_of_dos_code/16);
+	m1->intermed_cdszdiff = (m1->guest_unumblocks*32 - d->guest_ei->start_of_dos_code/16)
+		- (m1->host_numblocks*32 - d->host_ei->start_of_dos_code/16);
 
-	intermed_cmprreloc = (d->cmpr_reloc_tbl_len + 8)/16;
+	m1->intermed_cmprreloc = (d->cmpr_reloc_tbl_len + 8)/16;
 
-	if(ver==0x0100) {
-		pred_MINALLOC_nrm = guest_MINALLOC
-			+ (guest_ucodesize)/16
-			- (host_ucodesize)/16;
+	if(d->is_may90_beta) {
+		f1_mina_nrmMAY(c, d, m1);
+	}
+	else if(ver==0x0100) {
+		f1_mina_nrm100(c, d, m1);
 	}
 	else if(ver==0x0103 || ver==0x0105) {
-		pred_MINALLOC_nrm = guest_MINALLOC
-			+ (guest_ucodesize + 15)/16
-			- (host_ucodesize + 15)/16;
+		f1_mina_nrm103(c, d, m1);
 	}
 	else {
-		pred_MINALLOC_nrm = guest_MINALLOC
-			+ intermed_cdszdiff;
+		f1_mina_nrm112(c, d, m1);
 	}
-	de_dbg(c, "pred. h.MINALLOC-nrm: 0x%04x", (UI)pred_MINALLOC_nrm);
+	de_dbg(c, "pred. h.MINALLOC-nrm: 0x%04x", (UI)m1->pred_MINALLOC_nrm);
 
-	if(ver==0x0100) {
-		pred_MINALLOC_min = 0;
+	if(d->is_may90_beta) {
+		m1->pred_MINALLOC_min = 0x200;
+	}
+	else if(ver==0x0100) {
+		m1->pred_MINALLOC_min = 0;
 	}
 	else if(ver==0x0103 || ver==0x0105) {
-		pred_MINALLOC_min =
-			(guest_ucodesize + 15)/16
-			- (host_ucodesize + 15)/16
-			+ intermed_cmprreloc
-			+ 256;
+		f1_mina_min103(c, d, m1);
 	}
 	else if(ver==0x010b) {
-		pred_MINALLOC_min = 0x101;
+		// Based on very few sample files.
+		m1->pred_MINALLOC_min = 0x101;
 	}
 	else {
-		pred_MINALLOC_min = intermed_cdszdiff + intermed_cmprreloc + 0x140;
+		f1_mina_min112(c, d, m1);
 	}
 
-	de_dbg(c, "pred. h.MINALLOC-min: 0x%04x", (UI)pred_MINALLOC_min);
+	de_dbg(c, "pred. h.MINALLOC-min: 0x%04x", (UI)m1->pred_MINALLOC_min);
 
 	mmalgstr = "?";
-	if(pred_MINALLOC_min==pred_MINALLOC_nrm) {
-		pred_MINALLOC = pred_MINALLOC_nrm;
+	if(m1->pred_MINALLOC_min==m1->pred_MINALLOC_nrm) {
+		m1->pred_MINALLOC = m1->pred_MINALLOC_nrm;
 		mmalgstr = "nrm=min";
 	}
-	else if(pred_MINALLOC_min>pred_MINALLOC_nrm) {
-		pred_MINALLOC = pred_MINALLOC_min;
+	else if(m1->pred_MINALLOC_min>m1->pred_MINALLOC_nrm) {
+		m1->pred_MINALLOC = m1->pred_MINALLOC_min;
 		mmalgstr = "min";
 	}
 	else {
-		pred_MINALLOC = pred_MINALLOC_nrm;
+		m1->pred_MINALLOC = m1->pred_MINALLOC_nrm;
 		mmalgstr = "nrm";
 	}
 
-	if(pred_MINALLOC >= 0x8000) {
-		pred_MINALLOC = 0;
+	if(m1->pred_MINALLOC >= 0x8000) {
+		m1->pred_MINALLOC = 0;
 		mmalgstr = "toobig";
-		minmem_toobig_flag = 1;
+		m1->minmem_toobig_flag = 1;
 	}
 
-	de_dbg(c, "pred. h.MINALLOC    : 0x%04x [%s,%s] (v%x)", (UI)pred_MINALLOC,
-		((pred_MINALLOC==host_MINALLOC)?"CORRECT":"WRONG"), mmalgstr, ver);
+	de_dbg(c, "pred. h.MINALLOC    : 0x%04x [%s,%s] (v%x)", (UI)m1->pred_MINALLOC,
+		((m1->pred_MINALLOC==m1->host_MINALLOC)?"CORRECT":"WRONG"), mmalgstr, ver);
 
 	// ------------------------ AX
+	if(!d->ax_val) goto after_ax;
 
 	de_dbg(c, "AX                  : 0x%04x", (UI)d->ax_val);
 
 	if(ver==0x0100) {
-		pred_AX_nrm = 0;
+		m1->pred_AX_nrm = 0;
 	}
 	else if(ver==0x0103 || ver==0x0105) {
-		// for v1.03 & v1.05.
-		pred_AX_nrm = guest_MINALLOC + ((guest_ucodesize + 0x0f)>>4);
+		f1_ax_nrm103(c, d, m1);
 	}
 	else if(ver==0x010b) {
 		// Most v1.11 files use the v1.03 algorithm, but I found
 		// a few that use the v1.12 algorithm.
-		pred_AX_nrm = guest_MINALLOC + ((guest_ucodesize + 0x0f)>>4);
+		f1_ax_nrm103(c, d, m1);
 	}
 	else  { // v1.12+
-		pred_AX_nrm = guest_MINALLOC - 0x10 + ((guest_ucodesize + 0x0f)>>4);
+		f1_ax_nrm112(c, d, m1);
 	}
 
-	de_dbg(c, "pred. AX-nrm        : 0x%04x", (UI)pred_AX_nrm);
+	de_dbg(c, "pred. AX-nrm        : 0x%04x", (UI)m1->pred_AX_nrm);
 
 	if(ver==0x0100) {
-		pred_AX_min = ((d->guest_ei->end_of_dos_code+15)>>4) + 0x110;
+		f1_ax_min100(c, d, m1);
 	}
 	else if(ver==0x0103 || ver==0x0105 || ver==0x010b) {
-		pred_AX_min = ((guest_ucodesize+15)>>4)
-			+ intermed_cmprreloc + 0x100;
+		f1_ax_min103(c, d, m1);
 	}
 	else { // v1.12+
-		pred_AX_min = ((guest_ucodesize+15)>>4)
-			+ intermed_cmprreloc + 0x130;
-
-		if(ver>=0x10e && ver<=0x201) {
-			calc_AX80 = 1;
-		}
+		f1_ax_min112(c, d, m1);
 	}
 
-	de_dbg(c, "pred. AX-min        : 0x%04x", (UI)pred_AX_min);
+	de_dbg(c, "pred. AX-min        : 0x%04x", (UI)m1->pred_AX_min);
 
-	axalgstr = "?";
-	if(pred_AX_min == pred_AX_nrm) {
-		pred_AX1 = pred_AX_nrm;
-		axalgstr = "nrm=min";
+	if(ver<0x10e) {
+		f1_ax_finSTD(c, d, m1);
 	}
-	else if(pred_AX_min > pred_AX_nrm) {
-		pred_AX1 = pred_AX_min;
-		axalgstr = "min";
-	}
-	else {
-		pred_AX1 = pred_AX_nrm;
-		axalgstr = "nrm";
+	else { // v1.14+
+		f1_ax_fin114(c, d, m1);
 	}
 
-	pred_AX = pred_AX1; // Tentative
-
-	if(calc_AX80) {
-		i64 stack_top;
-		i64 axdiff;
-
-		stack_top = d->footer.regSS*16 + d->footer.regSP;
-		axdiff = pred_AX1*16-stack_top;
-
-		de_dbg(c, "pred. AX1           : 0x%04x", (UI)pred_AX1);
-		de_dbg(c, "AX1/stack diff:     : %+"I64_FMT, axdiff);
-
-		if(axdiff>=1 && axdiff<=1264) {
-			ax_adj = 80;
-		}
-
-		de_dbg(c, "AX1 adjustment:     : %+"I64_FMT, ax_adj);
-		pred_AX = pred_AX1 + ax_adj;
+	if(m1->pred_AX > 0xffff) {
+		m1->pred_AX = 0xffff;
 	}
 
-	if(pred_AX > 0xffff) {
-		pred_AX = 0xffff;
-	}
-
-	verdict = (pred_AX==d->ax_val ? "CORRECT":"WRONG");
+	verdict = (m1->pred_AX==d->ax_val ? "CORRECT":"WRONG");
 	de_dbg(c, "pred. AX            : 0x%04x [%s,%s] (v%x)",
-		(UI)pred_AX, verdict, axalgstr, (UI)ver);
+		(UI)m1->pred_AX, verdict, m1->axalgstr, (UI)ver);
 
+after_ax:
 	// ------------------------ MAXALLOC
 
-	if(ver>=0x010b) {
-		i64 tmp;
-
-		if(minmem_toobig_flag) {
-			maxmemalgstr = "minmemtoobig";
-			pred_MAXALLOC = 0xffff;
-			goto maxalloc_done;
-		}
-
-		if(guest_MAXALLOC==0xffff) {
-			maxmemalgstr = "copied";
-			pred_MAXALLOC = 0xffff;
-			goto maxalloc_done;
-		}
-
-		tmp = guest_MAXALLOC + (pred_MINALLOC - guest_MINALLOC);
-		if(tmp<0) tmp = 0;
-		// There is a bug in PKLITE v1.12+. If guest_MAXALLOC < 0xffff,
-		// and the calculated host MAXALLOC is > 0xffff, it will wrap around to a
-		// way-too-small number.
-		// Easily reproduced by setting guest MAXALLOC to, say, 0xfffe.
-		tmp = tmp % 65536;
-
-		if(tmp>=0x8000) {
-			maxmemalgstr = "max";
-			pred_MAXALLOC = 0xffff;
-			goto maxalloc_done;
-		}
-
-		if(ax_adj>0) {
-			// The >=0x8000 test happens before this. Therefore, the final
-			// MAXMEM can be up to 0x804f.
-			maxmemalgstr = "nrm80";
-			tmp = tmp + 80;
-		}
-		else {
-			maxmemalgstr = "nrm";
-		}
-
-		pred_MAXALLOC = tmp;
+	if(d->load_high) {
+		m1->maxmemalgstr = "loadhigh";
+		m1->pred_MAXALLOC = 0;
 	}
-	else {
-		if(guest_MAXALLOC < pred_MINALLOC) {
-			maxmemalgstr = "min";
-			pred_MAXALLOC = pred_MINALLOC;
-		}
-		else {
-			maxmemalgstr = "copied";
-			pred_MAXALLOC = guest_MAXALLOC;
-		}
+	else if(d->is_may90_beta || d->is_jul90_beta) {
+		m1->maxmemalgstr = "fixed";
+		m1->pred_MAXALLOC = 0xffff;
+	}
+	else if(ver<0x010b) {
+		f1_maxa_100(c, d, m1);
+	}
+	else { // v1.11+
+		f1_maxa_112(c, d, m1);
 	}
 
-maxalloc_done:
-	verdict = (pred_MAXALLOC==host_MAXALLOC)?"CORRECT":"WRONG";
+	verdict = (m1->pred_MAXALLOC==m1->host_MAXALLOC)?"CORRECT":"WRONG";
 
-	de_dbg(c, "pred. h.MAXALLOC    : 0x%04x [%s,%s]", (UI)pred_MAXALLOC,
-		verdict, maxmemalgstr);
-
+	de_dbg(c, "pred. h.MAXALLOC    : 0x%04x [%s,%s]", (UI)m1->pred_MAXALLOC,
+		verdict, m1->maxmemalgstr);
 
 done:
+	de_free(c, m1);
+	de_dbg_indent_restore(c, saved_indent_level);
+}
+
+struct minmax2_ctx {
+	i64 host_numblocks;
+	i64 host_hdrsize_para;
+	i64 host_MINALLOC;
+	i64 guest_MINALLOC_1;
+	i64 guest_ucodesize;
+	i64 guest_ucodesize_para;
+	i64 lenfinal_para_min, lenfinal_para_max;
+	i64 guest_expr1_min, guest_expr1_max;
+	i64 guest_MINALLOC_min;
+	i64 guest_MINALLOC_max;
+	i64 intermed_cdszdiff_min, intermed_cdszdiff_max;
+	i64 intermed_cmprreloc;
+	i64 pred_MINALLOCmin_min, pred_MINALLOCmin_max;
+
+};
+
+// Predict guest settings from host settings
+static void temp_minmaxalloc2(deark *c, lctx *d)
+{
+	struct minmax2_ctx *m2 = NULL;
+	u8 min_formula_possible = 0;
+	int saved_indent_level;
+
+	de_dbg_indent_save(c, &saved_indent_level);
+	m2 = de_malloc(c, sizeof(struct minmax2_ctx));
+
+	de_dbg(c, "[MIN/MAX alloc prediction]");
+	de_dbg_indent(c, 1);
+
+	m2->host_numblocks = de_getu16le(4);
+	m2->host_hdrsize_para = de_getu16le(8);
+	m2->host_MINALLOC = de_getu16le(10);
+
+	////////// MINALLOC-nrm
+	m2->guest_ucodesize = d->guest_ei->end_of_dos_code - d->guest_ei->start_of_dos_code;
+	m2->guest_ucodesize_para = (m2->guest_ucodesize+15)/16;
+
+	m2->guest_MINALLOC_1 = m2->host_MINALLOC + (m2->host_numblocks*32 - m2->host_hdrsize_para);
+	m2->lenfinal_para_min = 1;
+	m2->lenfinal_para_max = 32;
+	// guest_expr1 = (ORIG_NUM_BLOCKS*32 - ORIG_HDR_SIZE)
+	m2->guest_expr1_max = m2->guest_ucodesize_para + 32 - m2->lenfinal_para_min;
+	m2->guest_expr1_min = m2->guest_ucodesize_para + 32 - m2->lenfinal_para_max;
+	m2->guest_MINALLOC_min = m2->guest_MINALLOC_1 - m2->guest_expr1_max;
+	// FIXME: guest_MINALLOC_min can be < 0
+	m2->guest_MINALLOC_max = m2->guest_MINALLOC_1 - m2->guest_expr1_min;
+	de_dbg(c, "pred g.MINALLOC nrm : 0x%04x to 0x%04x",
+		(UI)m2->guest_MINALLOC_min, (UI)m2->guest_MINALLOC_max);
+
+	////////// MINALLOC-min
+
+	//HOST_MINALLOC_MIN_112() :=
+	//  ( ORIG_NUM_BLOCKS*32 - ORIG_HDR_SIZE )
+	//  - ( HOST_NUM_BLOCKS*32 - HOST_HDR_SIZE )
+	//  + (CMPR_RELOC_TBL_SIZE+8)/16 + 320
+
+	// Calculate the min and max that MINALLOC could be if the "min" formula was used.
+	m2->intermed_cdszdiff_min = m2->guest_expr1_min - (m2->host_numblocks*32 - m2->host_hdrsize_para);
+	m2->intermed_cdszdiff_max = m2->guest_expr1_max - (m2->host_numblocks*32 - m2->host_hdrsize_para);
+
+	m2->intermed_cmprreloc = (d->cmpr_reloc_tbl_len + 8)/16;
+
+	m2->pred_MINALLOCmin_min = m2->intermed_cdszdiff_min + m2->intermed_cmprreloc + 320;
+	m2->pred_MINALLOCmin_max = m2->intermed_cdszdiff_max + m2->intermed_cmprreloc + 320;
+	if(m2->host_MINALLOC>=m2->pred_MINALLOCmin_min && m2->host_MINALLOC<m2->pred_MINALLOCmin_max) {
+		min_formula_possible = 1;
+	}
+	de_dbg(c, "minallocmin range   : 0x%04x to 0x%04x %s",
+		(UI)m2->pred_MINALLOCmin_min, (UI)m2->pred_MINALLOCmin_max,
+		(min_formula_possible?"***":""));
+
+	if(min_formula_possible) {
+		// If min was used, lots of things cancel, and we know that
+		// ORIG_MINALLOC < (CMPR_RELOC_TBL_SIZE+8)/16 + 320
+
+		de_dbg(c, "if minmin, then guest MINALLOC < 0x%04x",
+			(UI)(m2->intermed_cmprreloc + 320));
+	}
+
 	de_dbg_indent_restore(c, saved_indent_level);
 }
 #endif
@@ -2099,6 +2412,116 @@ static void acquire_new_exe_header(deark *c, lctx *d)
 	reconstruct_header(c, d);
 done:
 	;
+}
+
+// Do some messy fingerprinting to figure out the version (or a range of
+// possible versions) of PKLITE that made the file.
+// This doesn't do everything it could do; it's focused on the things that
+// might be useful to know.
+static void do_detect_version(deark *c, lctx *d)
+{
+	static const char *hs = "detected version: ";
+
+	if(d->dparams.v120_cmpr) {
+		pkl_set_detver_special(d);
+		goto done;
+	}
+
+	if(d->is_may90_beta) {
+		pkl_set_detver(d, PKL_DVER_MAYBETA, 0);
+		goto done;
+	}
+
+	if(d->intro_class==INTRO_CLASS_100) {
+		pkl_set_detver_range(d, PKL_DVER_JULBETA, PKL_DVER_105, 0);
+		if(d->decompr_class==DECOMPR_CLASS_COMMON) {
+			if(d->decompr_byte9==0xbe) {
+				pkl_set_detver_range(d, PKL_DVER_JULBETA, PKL_DVER_103, 0);
+				if(d->dparams.large_cmpr && !d->dparams.extra_cmpr) {
+					if(d->copier_byte17==0x21) {
+						pkl_set_detver(d, PKL_DVER_JULBETA, 0);
+						goto done;
+					}
+					else if(d->copier_byte17==0x22) {
+						pkl_set_detver(d, PKL_DVER_100, 0);
+						goto done;
+					}
+					else if(d->copier_byte17==0x23) {
+						pkl_set_detver(d, PKL_DVER_103, 0);
+						goto done;
+					}
+				}
+				if(!d->dparams.large_cmpr && !d->dparams.extra_cmpr) {
+					if(d->copier_byte17==0xc2) {
+						pkl_set_detver(d, PKL_DVER_JULBETA, 0);
+						goto done;
+					}
+					else {
+						pkl_set_detver_range(d, PKL_DVER_100, PKL_DVER_103, 0);
+					}
+				}
+				if(!d->dparams.large_cmpr && d->dparams.extra_cmpr) {
+					if(d->copier_byte17==0xc6 && d->copier_byte23==0x4c) {
+						pkl_set_detver(d, PKL_DVER_JULBETA, 0);
+						goto done;
+					}
+					else {
+						pkl_set_detver_range(d, PKL_DVER_100, PKL_DVER_103, 0);
+					}
+				}
+			}
+			else if(d->decompr_byte9==0x8c) {
+				pkl_set_detver(d, PKL_DVER_105, 0);
+				goto done;
+			}
+		}
+	}
+	else if(d->intro_class==INTRO_CLASS_112) {
+		pkl_set_detver_range(d, PKL_DVER_111, PKL_DVER_113, 0);
+	}
+	else if(d->intro_class==INTRO_CLASS_114) {
+		pkl_set_detver_range(d, PKL_DVER_114, PKL_DVER_115, 0);
+	}
+	else if(d->intro_class==INTRO_CLASS_150) {
+		pkl_set_detver_range(d, PKL_DVER_150, PKL_DVER_201, 0);
+	}
+
+	switch(d->ver_reported.ver_num) {
+	case 0x100:
+		pkl_set_detver_range(d, PKL_DVER_MAYBETA, PKL_DVER_100, 1);
+		break;
+	case 0x103:
+		pkl_set_detver(d, PKL_DVER_103, 1);
+		break;
+	case 0x10b:
+		pkl_set_detver(d, PKL_DVER_111, 1);
+		break;
+	case 0x10c:
+	case 0x10d:
+		pkl_set_detver_range(d, PKL_DVER_112, PKL_DVER_113, 1);
+		break;
+	}
+
+done:
+	if(d->verdetect.isset && d->verdetect.ver_min==PKL_DVER_JULBETA &&
+		d->verdetect.ver_max==PKL_DVER_JULBETA)
+	{
+		d->is_jul90_beta = 1;
+	}
+	if(d->verdetect.isset) {
+		if(d->verdetect.special_version) {
+			de_dbg(c, "%sspecial", hs);
+		}
+		else if(d->verdetect.ver_min==d->verdetect.ver_max) {
+			de_dbg(c, "%s%u", hs, d->verdetect.ver_min);
+		}
+		else {
+			de_dbg(c, "%s%u to %u", hs, d->verdetect.ver_min, d->verdetect.ver_max);
+		}
+	}
+	else {
+		de_dbg(c, "%sunknown", hs);
+	}
 }
 
 static void do_pklite_exe(deark *c, lctx *d)
@@ -2184,10 +2607,14 @@ static void do_pklite_exe(deark *c, lctx *d)
 		goto done;
 	}
 
+	do_detect_version(c, d);
+
 	acquire_new_exe_header(c, d);
 	if(d->errflag) goto done;
+	detect_beta_filesize_bug(c, d);
 #if PKL_DBG_MINMAXALLOC
 	temp_minmaxalloc(c, d);
+	temp_minmaxalloc2(c, d);
 #endif
 
 	do_write_dcmpr(c, d);

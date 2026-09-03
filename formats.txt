@@ -246,6 +246,10 @@ Deark -- Information about supported formats
 * Esm Software PIX (module="esm_pix")
   - Extract embedded JPEG file.
 
+* EZ-Art Professional .EZA (module="eza")
+  A paint program for Atari ST, by Floppyshop.
+  - File extension must be ".eza" (or use "-m eza").
+
 * Falcon True Color (module="ftc")
 
 * farbfeld (module="farbfeld")
@@ -340,6 +344,7 @@ Deark -- Information about supported formats
 
 * ILBM and related IFF-based images (module="ilbm")
   - Supports ILBM, ACBM, PBM, RGBN, RGB8
+  - Supports MLDF (Mean Streets), if a palette is present
   - Supports 1-8 bit paletted, 24-bit truecolor
   - Supports HAM6, HAM8, Halfbrite
   - Supports color-keyed and bitmask transparency
@@ -789,7 +794,6 @@ Deark -- Information about supported formats
    -opt atari:respectpal - Don't ignore a seemingly bad 2-color palette
 
 * VBM (VDC BitMap) (module="vbm")
-  - Version 2 only
 
 * Video Master (.flm/.vid/.vsq) (module="videomaster") (experimental)
   - Minimal support. Extracts the video frames.
