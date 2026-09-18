@@ -29,9 +29,15 @@ DE_DECLARE_MODULE(de_module_exe);
 #define DE_RT_ANIICON       22
 #define DE_RT_MANIFEST      24
 
+// OS/2 PM resource types, used in LX/LE resource tables (per BSEDOS.H's RT_* -- a
+// different numbering than the Windows RT_* scheme (DE_RT_*) above).
+#define LX_RT_POINTER       1 // Icon or cursor
+#define LX_RT_BITMAP        2
+#define LX_RT_FONT          7 // OS/2 PM font
+
 struct rsrc_type_info_struct;
 
-typedef struct localctx_struct {
+typedef struct localctx_structEXE {
 	u8 fmt;
 	u8 subfmt;
 	u8 execomp_mode; // 0 or 1; 0xff=unspecified
@@ -70,6 +76,9 @@ typedef struct localctx_struct {
 	i64 lx_rsrc_tbl_offset;
 	i64 lx_rsrc_tbl_entries;
 	i64 lx_data_pages_offset;
+	i64 lx_page_size;
+	dbuf *lx_objimg_cache; // Decompressed page image of the most-recently-used object.
+	i64 lx_objimg_cache_obj_num; // 0 means "no object cached"
 
 	i64 pe_opt_hdr_size;
 	i64 pe_sections_offset;
@@ -100,6 +109,55 @@ struct rsrc_type_info_struct {
 	const char *name;
 	rsrc_decoder_fn decoder_fn;
 };
+
+// OS/2 "EXEPACK:1" decompressor, originally by Dimitriy Ryazantcev.
+// (Object Page Table flag == 1, "iterated" page).
+// Token stream: [num_iterations:u16][blocklen:u16][blocklen bytes of data], repeated;
+// the data block is emitted num_iterations times; the stream ends when
+// num_iterations==0.
+// TODO: Maybe move this to the fmtutil library.
+static void os2exepack1_codectype1(deark *c, struct de_dfilter_in_params *dcmpri,
+	struct de_dfilter_out_params *dcmpro, struct de_dfilter_results *dres,
+	void *codec_private_params)
+{
+	i64 pos = dcmpri->pos;
+	i64 endpos = dcmpri->pos + dcmpri->len;
+	const char *errdesc = "Malformed data";
+
+	while(1) {
+		i64 num_iter, blk_len, k;
+
+		if(pos+1 > endpos) goto done; // Clean end of stream (no more tokens)
+		if(pos+2 > endpos) { /* errdesc = "Truncated repeat-count field"; */ goto malformed; }
+		num_iter = dbuf_getu16le_p(dcmpri->f, &pos);
+		if(num_iter==0) goto done; // Normal terminator token
+
+		if(pos+2 > endpos) { /* errdesc = "Truncated block-length field"; */ goto malformed; }
+		blk_len = dbuf_getu16le_p(dcmpri->f, &pos);
+		if(pos+blk_len > endpos) { /* errdesc = "Truncated block data"; */ goto malformed; }
+		if(dcmpro->len_known && dcmpro->f->len + blk_len*num_iter > dcmpro->expected_len) {
+			// errdesc = "Output size exceeds expected page size";
+			goto malformed;
+		}
+
+		for(k=0; k<num_iter; k++) {
+			dbuf_copy(dcmpri->f, pos, blk_len, dcmpro->f);
+		}
+		pos += blk_len;
+
+		if(dcmpro->len_known && dcmpro->f->len >= dcmpro->expected_len) goto done;
+	}
+
+malformed:
+	de_dfilter_set_errorf(c, dres, "exepack1", "%s", errdesc);
+done:
+	if(dcmpro->len_known && dcmpro->f->len < dcmpro->expected_len) {
+		dbuf_write_zeroes(dcmpro->f, dcmpro->expected_len - dcmpro->f->len);
+	}
+	dbuf_flush(dcmpro->f);
+	dres->bytes_consumed_valid = 1;
+	dres->bytes_consumed = pos - dcmpri->pos;
+}
 
 static void do_certificate(deark *c, lctx *d, i64 pos1, i64 len)
 {
@@ -512,6 +570,12 @@ static void do_lx_or_le_ext_header(deark *c, lctx *d, i64 pos)
 	else {
 		d->lx_page_offset_shift = de_getu32le(pos+0x2c);
 		de_dbg(c, "page offset shift: %d", (int)d->lx_page_offset_shift);
+	}
+
+	d->lx_page_size = de_getu32le(pos+0x28);
+	de_dbg(c, "page size: %"I64_FMT, d->lx_page_size);
+	if(d->lx_page_size<1 || d->lx_page_size>65536) {
+		d->lx_page_size = 4096; // Sane default, in case of a bad or unsupported value.
 	}
 
 	x1 = de_getu32le(pos+0x40);
@@ -1541,16 +1605,16 @@ done:
 
 // Sniff the resource data, and return a suitable filename extension.
 // Or NULL, if unidentified.
-static const char *identify_lx_rsrc(deark *c, lctx *d, i64 pos, i64 len)
+static const char *identify_lx_rsrc(deark *c, dbuf *f, i64 pos, i64 len)
 {
 	u8 buf[2];
 	int is_ba = 0;
 
 	if(len<16) return NULL;
-	de_read(buf, pos, 2);
+	dbuf_read(f, buf, pos, 2);
 	if(!de_memcmp(buf, "BA", 2)) {
 		// Bitmap Array container format. Read the real type.
-		de_read(buf, pos+14, 2);
+		dbuf_read(f, buf, pos+14, 2);
 		is_ba = 1;
 	}
 
@@ -1566,10 +1630,131 @@ static const char *identify_lx_rsrc(deark *c, lctx *d, i64 pos, i64 len)
 	return NULL;
 }
 
+static void get_lx_os2font_facename(deark *c, lctx *d, dbuf *objimg, i64 pos, i64 len,
+	de_finfo *fi)
+{
+	UI points;
+	de_ucstring *s = NULL;
+
+	if(len<144) goto done; // Need through usNominalPointSize (block+122)
+	// FONTSIGNATURE.ulIdentity; the FONTMETRICS block follows the 20-byte
+	// FONTSIGNATURE at pos+20.
+#define OS2_FONT_SIGNATURE 0xfffffffeU
+	if((UI)dbuf_getu32le(objimg, pos) != OS2_FONT_SIGNATURE) goto done;
+	if(dbuf_memcmp(objimg, pos+8, "OS/2 FONT", 9)) goto done;
+
+	points = (UI)dbuf_getu16le(objimg, pos+20+122); // usNominalPointSize, in decipoints
+	s = ucstring_create(c);
+	dbuf_read_to_ucstring_n(objimg, pos+20+40, 32, len-(20+40), s,
+		DE_CONVFLAG_STOP_AT_NUL, DE_ENCODING_ASCII);
+	if(s->len<1) goto done;
+	ucstring_printf(s, DE_ENCODING_LATIN1, "-%u", points/10);
+	de_finfo_set_name_from_ucstring(c, fi, s, 0);
+
+done:
+	ucstring_destroy(s);
+}
+
+// OS/2 analogue of do_extract_FONT() (for Windows FNT resources).
+// No glyph rendering -- just naming + raw extraction.
+static void do_lx_extract_font(deark *c, lctx *d, dbuf *objimg, i64 pos, i64 len)
+{
+	de_finfo *fi = NULL;
+
+	if(!d->extract_std_resources) goto done;
+	if(len<20) goto done;
+
+	fi = de_finfo_create(c);
+	get_lx_os2font_facename(c, d, objimg, pos, len, fi);
+	dbuf_create_file_from_slice(objimg, pos, len, "os2.fnt", fi, 0);
+done:
+	de_finfo_destroy(c, fi);
+}
+
+// LX/LE Object Page Table entry "flags" field (offset +6 in each 8-byte entry).
+#define LX_PGFLAG_VALID      0 // Stored verbatim
+#define LX_PGFLAG_ITERDATA   1 // "EXEPACK:1" -- iterated (RLE-of-blocks) page
+#define LX_PGFLAG_ITERDATA2  5 // "EXEPACK:2" -- iterated data page, type II (LZ-in-page)
+
+// Copy one Object Page Table page into objimg, decompressing if needed,
+// per its flags.
+static void do_lx_acquire_page(deark *c, lctx *d, dbuf *objimg,
+	i64 obj_num, i64 page_num_1based)
+{
+	i64 lpos;
+	i64 pg_data_offset_raw;
+	i64 data_size;
+	i64 flags;
+	i64 filepos;
+	dbuf *tmppg = NULL;
+	struct de_dfilter_in_params dcmpri;
+	struct de_dfilter_out_params dcmpro;
+	struct de_dfilter_results dres;
+
+	lpos = d->lx_object_page_tbl_offset + 8*(page_num_1based-1);
+	pg_data_offset_raw = de_getu32le(lpos);
+	data_size = de_getu16le(lpos+4);
+	flags = de_getu16le(lpos+6);
+
+	filepos = pg_data_offset_raw;
+	if(d->lx_page_offset_shift > 0) {
+		filepos <<= (UI)d->lx_page_offset_shift;
+	}
+	filepos += d->lx_data_pages_offset;
+
+	de_dbg(c, "page #%d at %"I64_FMT": flags=%d dpos=%"I64_FMT" dlen=%"I64_FMT,
+		(int)page_num_1based,
+		lpos, (int)flags, filepos, data_size);
+
+	switch(flags) {
+	case LX_PGFLAG_VALID:
+		dbuf_copy(c->infile, filepos, data_size, objimg);
+		if(data_size < d->lx_page_size) {
+			dbuf_write_zeroes(objimg, d->lx_page_size - data_size);
+		}
+		break;
+	case LX_PGFLAG_ITERDATA:
+	case LX_PGFLAG_ITERDATA2:
+		{
+			tmppg = dbuf_create_membuf(c, d->lx_page_size, 0);
+			// TODO: Can data_size be bigger than lx_page_size?
+			dbuf_set_length_limit(tmppg, d->lx_page_size);
+			de_dfilter_init_objects(c, &dcmpri, &dcmpro, &dres);
+			dcmpri.f = c->infile;
+			dcmpri.pos = filepos;
+			dcmpri.len = data_size;
+			dcmpro.f = tmppg;
+			dcmpro.len_known = 1;
+			dcmpro.expected_len = d->lx_page_size;
+			if(flags==LX_PGFLAG_ITERDATA) {
+				de_dbg(c, "[decompressing exepack1]");
+				os2exepack1_codectype1(c, &dcmpri, &dcmpro, &dres, NULL);
+			}
+			else {
+				de_dbg(c, "[decompressing exepack2]");
+				fmtutil_os2exepack2_codectype1(c, &dcmpri, &dcmpro, &dres, NULL);
+			}
+			if(dres.errcode) {
+				de_warn(c, "Failed to decompress LX page #%d (obj #%d, file offset "
+					"%"I64_FMT"): %s",
+					(int)page_num_1based, (int)obj_num, filepos,
+					de_dfilter_get_errmsg(c, &dres));
+			}
+			dbuf_copy(tmppg, 0, tmppg->len, objimg);
+		}
+		break;
+	default: // LX_PGFLAG_INVALID, LX_PGFLAG_ZEROED, LX_PGFLAG_RANGE, or unknown
+		dbuf_write_zeroes(objimg, d->lx_page_size);
+		break;
+	}
+
+	dbuf_close(tmppg);
+}
+
 // Extract a resource from an LX file, given the information from an Object Table
 // entry.
 static void do_lx_rsrc(deark *c, lctx *d,
-	i64 obj_num, i64 rsrc_offset, i64 rsrc_size, i64 rsrc_type)
+	i64 obj_num, i64 rsrc_offset, i64 rsrc_size, UI rsrc_type)
 {
 	i64 lpos;
 	i64 vsize;
@@ -1577,16 +1762,30 @@ static void do_lx_rsrc(deark *c, lctx *d,
 	i64 flags;
 	i64 page_table_index;
 	i64 page_table_entries;
-	i64 rsrc_offset_real;
-	i64 pg_data_offset_raw;
+	i64 j;
+	dbuf *objimg = NULL; // This is a copy; do not close.
 	const char *ext;
-	//i64 data_size;
 	int saved_indent_level;
 
 	de_dbg_indent_save(c, &saved_indent_level);
 	if(obj_num<1 || obj_num>d->lx_object_tbl_entries) {
 		de_err(c, "Invalid object number (%d).", (int)obj_num);
 		goto done;
+	}
+
+	// TODO?: Since we already know the resource type, maybe if we aren't
+	// going to do anything with it, we should stop here, or at least not
+	// bother to decompress anything. But we still might want to know the
+	// compression type, and other dbg info.
+
+	// Most LX/LE files put multiple resources in the same object, so cache the most
+	// recently decompressed/assembled object image and reuse it when consecutive
+	// resource-table entries refer to the same object, instead of redecompressing all
+	// of that object's pages from scratch for every single resource.
+	if(d->lx_objimg_cache && d->lx_objimg_cache_obj_num==obj_num) {
+		//de_dbg2(c, "[reusing cached page image for object #%d]", (int)obj_num);
+		objimg = d->lx_objimg_cache;
+		goto have_objimg;
 	}
 
 	// Read the Object Table
@@ -1604,41 +1803,55 @@ static void do_lx_rsrc(deark *c, lctx *d,
 		vsize, reloc_base_addr, (UI)flags, (int)page_table_index,
 		(int)page_table_entries);
 
+	de_dbg_indent(c, -1);
 	if(page_table_index<1) goto done;
-	de_dbg_indent(c, -1);
+	if(page_table_entries<1 || page_table_entries>100000) goto done;
 
-	// Now read the Object Page table
-	lpos = d->lx_object_page_tbl_offset + 8*(page_table_index-1);
-	de_dbg(c, "LX page table entry at %"I64_FMT, lpos);
-	de_dbg_indent(c, 1);
-
-	pg_data_offset_raw = de_getu32le(lpos);
-	//data_size = de_getu16le(lpos+4);
-
-	rsrc_offset_real = pg_data_offset_raw;
-	if(d->lx_page_offset_shift > 0 ) {
-		rsrc_offset_real <<= (UI)d->lx_page_offset_shift;
+	// Decompress/assemble this object's pages into a single contiguous image, so that
+	// a resource can be sliced out of it at its virtual offset, regardless of how its
+	// pages are individually compressed or where they live in the file.
+	if(d->lx_objimg_cache) {
+		dbuf_empty(d->lx_objimg_cache);
 	}
-	rsrc_offset_real += d->lx_data_pages_offset;
-	rsrc_offset_real += rsrc_offset;
-	de_dbg(c, "resource offset: %"I64_FMT, rsrc_offset_real);
+	else {
+		d->lx_objimg_cache = dbuf_create_membuf(c, page_table_entries*d->lx_page_size, 0);
+	}
+	dbuf_set_length_limit(d->lx_objimg_cache, (page_table_entries+1)*d->lx_page_size);
+	d->lx_objimg_cache_obj_num = obj_num;
+	objimg = d->lx_objimg_cache;
+
+	de_dbg(c, "LX object page image: %d page(s), starting at page table entry %d",
+		(int)page_table_entries, (int)page_table_index);
+	de_dbg_indent(c, 1);
+	for(j=0; j<page_table_entries; j++) {
+		do_lx_acquire_page(c, d, objimg, obj_num, page_table_index+j);
+	}
 	de_dbg_indent(c, -1);
+
+have_objimg:
+	if(rsrc_offset<0 || rsrc_size<0 || rsrc_offset+rsrc_size>objimg->len) {
+		de_warn(c, "LX resource (obj #%d, offset %"I64_FMT", size %"I64_FMT") out of range "
+			"(%"I64_FMT")",
+			(int)obj_num, rsrc_offset, rsrc_size, objimg->len);
+		goto done;
+	}
 
 	switch(rsrc_type) {
 		// TODO: Support other types of resources.
-	case 1: // Icon or cursor (?)
-	case 2: // Bitmap (?)
-		ext = identify_lx_rsrc(c, d, rsrc_offset_real, rsrc_size);
+	case LX_RT_POINTER:
+	case LX_RT_BITMAP:
+		ext = identify_lx_rsrc(c, objimg, rsrc_offset, rsrc_size);
 		if(!ext) break;
-		// TODO: This assumes the resource is stored contiguously in the file, but
-		// for all I know that isn't always the case.
 
 		// Unlike in NE and PE format, it seems that image resources in LX files
 		// include the BITMAPFILEHEADER. That makes it easy.
 		if(d->extract_std_resources) {
-			dbuf_create_file_from_slice(c->infile, rsrc_offset_real, rsrc_size,
+			dbuf_create_file_from_slice(objimg, rsrc_offset, rsrc_size,
 				ext, NULL, 0);
 		}
+		break;
+	case LX_RT_FONT:
+		do_lx_extract_font(c, d, objimg, rsrc_offset, rsrc_size);
 		break;
 	}
 
@@ -1646,12 +1859,23 @@ done:
 	de_dbg_indent_restore(c, saved_indent_level);
 }
 
+static const char *get_lx_rsrc_type_id_name(UI n)
+{
+	const char *nm = NULL;
+	switch(n) {
+	case LX_RT_POINTER: nm = "RT_POINTER"; break;
+	case LX_RT_BITMAP: nm = "RT_BITMAP"; break;
+	case LX_RT_FONT: nm = "RT_FONT"; break;
+	}
+	return nm?nm:"?";
+}
+
 static void do_lx_or_le_rsrc_tbl(deark *c, lctx *d)
 {
 	i64 i;
 	i64 lpos;
-	i64 type_id;
-	i64 name_id;
+	UI type_id;
+	UI name_id;
 	i64 rsrc_size;
 	i64 rsrc_object;
 	i64 rsrc_offset;
@@ -1668,14 +1892,15 @@ static void do_lx_or_le_rsrc_tbl(deark *c, lctx *d)
 	for(i=0; i<d->lx_rsrc_tbl_entries; i++) {
 		lpos = d->lx_rsrc_tbl_offset + 14*i;
 
-		type_id = de_getu16le(lpos);
-		name_id = de_getu16le(lpos+2);
+		type_id = (UI)de_getu16le(lpos);
+		name_id = (UI)de_getu16le(lpos+2);
 		rsrc_size = de_getu32le(lpos+4);
 		rsrc_object = de_getu16le(lpos+8);
 		rsrc_offset = de_getu32le(lpos+10);
 
-		de_dbg(c, "resource #%d: type=%d name=%d size=%"I64_FMT" obj=%d offset=%"I64_FMT, (int)i,
-			(int)type_id, (int)name_id, rsrc_size, (int)rsrc_object, rsrc_offset);
+		de_dbg(c, "resource #%d: type=%u (%s) name=%u size=%"I64_FMT" obj=%d offset=%"I64_FMT,
+			(int)i, type_id, get_lx_rsrc_type_id_name(type_id),
+			name_id, rsrc_size, (int)rsrc_object, rsrc_offset);
 
 		de_dbg_indent(c, 1);
 		do_lx_rsrc(c, d, rsrc_object, rsrc_offset, rsrc_size, type_id);
@@ -1983,6 +2208,7 @@ static void de_run_exe(deark *c, de_module_params *mparams)
 
 done:
 	if(d) {
+		dbuf_close(d->lx_objimg_cache);
 		de_free(c, d->ei);
 		de_free(c, d);
 	}

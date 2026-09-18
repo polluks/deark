@@ -156,6 +156,9 @@ Deark -- Information about supported formats
 * CD-I IFF-IMAG (module="cdi_imag") (experimental/incomplete)
   A format used on some CD-i discs.
 
+* CDView encrypted image (module="cdview_enc")
+  - Decrypt to the original format, usually JPEG.
+
 * COKE (Atari Falcon) (*.tg1) (module="coke")
 
 * ColoRIX (*.sc?, etc.) (module="colorix")
@@ -951,6 +954,9 @@ in the readme file.)
    -opt arj:reloc[=<n>] : Move the ARJ data, and disable some types of
      security/protection. Use with "-m arj" to convert most any self-extracting
      ARJ archive to plain ARJ.
+
+* ARTIPACK (module="artipack") (experimental)
+  Artisoft "INSTALL.PAK" format.
 
 * ARX (module="arx")
   Variant of LHA. Deark tries to convert it to LHA.
