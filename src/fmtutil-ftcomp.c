@@ -101,8 +101,6 @@
 
 #define DE_PERSISTENT_ITEM_FTCOMP_DATA 5
 
-struct ftc_ctx;
-
 struct ftc_tbls_type {
 	u16 ftc_descriptor_weights[FTC_DESCRIPTORTABLE_LEN];
 	u16 ftc_digitchain_weights[FTC_DESCRIPTORTABLE_LEN];
@@ -120,18 +118,19 @@ struct ftc_tbls_type {
 // existing entry to the front while overwriting it.
 struct ftc_mruring {
 	u16 buf[FTC_MRURING_SIZE];
-	unsigned int idx;
+	UI idx;
 };
 
-struct ftc_histbuf {
-	i64 total_len; // running per-member total emitted so far, for the cap_limit gate below
+struct ftc_stage2state {
+	i64 total_len; // running total emitted so far, for the cap_limit gate below
 	i64 cap_limit;
 	int failed;
-	struct de_lz77buffer *ring; // persists across the whole member
+	struct de_lz77buffer *ring; // persists across the whole item
+	dbuf *outf;
 };
 
-// Per-member decoder state: rings/decoders/stream_pos persist across a
-// member's blocks; raw_weights/model are per-block scratch; dec_digitchain
+// decoder state: rings/decoders/stream_pos persist across an
+// item's blocks; raw_weights/model are per-block scratch; dec_digitchain
 // (and the mode patch to the shared ftc_type_table/ftc_extrastep_table
 // globals) is owned by ftc_ensure_digitchain_decoder.
 struct ftc_decstate {
@@ -160,10 +159,10 @@ struct ftc_decstate {
 	struct fmtutil_huffman_decoder *dec_descriptor; // built once, cold init
 	struct fmtutil_huffman_decoder *dec_digitchain; // per-mode digit-chain decoder; rebuilt only on a mode change (see last_mode)
 
-	unsigned int mode;
-	unsigned int last_mode; // 0 initially; mode is always 1 or 2, so the first ftc_ensure_digitchain_decoder call always misses this cache.
+	UI mode;
+	UI last_mode; // 0 initially; mode is always 1 or 2, so the first ftc_ensure_digitchain_decoder call always misses this cache.
 
-	u32 stream_pos; // exact per-member decompressed length so far; see comment above FTC_STREAM_POS_THRESH1
+	u32 stream_pos; // exact decompressed length so far; see comment above FTC_STREAM_POS_THRESH1
 
 	u16 model_m0, model_m1, model_m2, model_m3;
 };
@@ -180,12 +179,12 @@ struct ftc_ctx {
 	i64 inf_len;
 
 	struct ftc_decstate dec;
-	struct ftc_histbuf hb;
+	struct ftc_stage2state hb;
 };
 
 static void initialize_ftctables(deark *c, struct ftc_tbls_type *tbls)
 {
-	unsigned int i;
+	UI i;
 	dbuf *tables_out = NULL;
 	u8 *ftcdata = NULL;
 	i64 tp;
@@ -239,7 +238,7 @@ static void acquire_ftctables(deark *c, struct ftc_decstate *dec)
 	}
 }
 
-static u16 ftc_mruring_peek(struct ftc_mruring *r, unsigned int nwords)
+static u16 ftc_mruring_peek(struct ftc_mruring *r, UI nwords)
 {
 	return r->buf[(r->idx + nwords) & FTC_MRURING_MASK];
 }
@@ -250,13 +249,13 @@ static void ftc_mruring_push(struct ftc_mruring *r, u16 value)
 	r->buf[r->idx] = value;
 }
 
-static void ftc_mruring_promote(struct ftc_mruring *r, unsigned int nwords, u16 value)
+static void ftc_mruring_promote(struct ftc_mruring *r, UI nwords, u16 value)
 {
 	int i;
 
 	for(i=(int)nwords-1; i>=0; i--) {
-		r->buf[(r->idx + (unsigned int)i + 1) & FTC_MRURING_MASK] =
-			r->buf[(r->idx + (unsigned int)i) & FTC_MRURING_MASK];
+		r->buf[(r->idx + (UI)i + 1) & FTC_MRURING_MASK] =
+			r->buf[(r->idx + (UI)i) & FTC_MRURING_MASK];
 	}
 	r->buf[r->idx] = value;
 }
@@ -275,7 +274,7 @@ static void ftc_mrurank_init(struct ftc_mrurank *mr)
 	mr->mru2 = 1;
 }
 
-static u16 ftc_mrurank_unrank(struct ftc_mrurank *mr, u16 dv, unsigned int mode)
+static u16 ftc_mrurank_unrank(struct ftc_mrurank *mr, u16 dv, UI mode)
 {
 	u16 out;
 
@@ -311,7 +310,7 @@ static u16 ftc_mrurank_unrank(struct ftc_mrurank *mr, u16 dv, unsigned int mode)
 // truncated/corrupt bitstream must keep reading (dbuf-OOB-safe) zero bits
 // forever rather than stop cold, matching this codec's own truncation
 // tolerance. `f`'s addressing covers the whole file, not just this
-// block/member: a block's bitstream may legitimately read a little past its
+// block/item: a block's bitstream may legitimately read a little past its
 // own boundary.
 
 // Decodes one symbol via the given fmtutil_huffman decoder, one bit at a
@@ -320,7 +319,7 @@ static u16 ftc_mrurank_unrank(struct ftc_mrurank *mr, u16 dv, unsigned int mode)
 static u16 ftc_br_read_sym(struct de_bitreader *br, struct fmtutil_huffman_decoder *hd)
 {
 	fmtutil_huffman_valtype val = 0;
-	unsigned int guard;
+	UI guard;
 
 	fmtutil_huffman_reset_cursor(hd->cursor);
 	for(guard=0; guard<FMTUTIL_HUFFMAN_MAX_CODE_LENGTH; guard++) {
@@ -339,40 +338,40 @@ static u16 ftc_br_read_sym(struct de_bitreader *br, struct fmtutil_huffman_decod
 // Leaf-id-indexed weight accessors; `wo` is the word-offset (pre-scaled by
 // 4). Unlike queue weight (ftc_queue_weight_get/_set), this is genuine input
 // data that outlives the merge queue.
-static u16 ftc_leaf_weight_get(struct ftc_decstate *ds, unsigned int wo) { return ds->leaf_weight[wo>>2]; }
-static void ftc_leaf_weight_set(struct ftc_decstate *ds, unsigned int wo, u16 v) { ds->leaf_weight[wo>>2] = v; }
-static void ftc_parent_set(struct ftc_decstate *ds, unsigned int child_wo, unsigned int parent_wo, unsigned int is_child0)
+static u16 ftc_leaf_weight_get(struct ftc_decstate *ds, UI wo) { return ds->leaf_weight[wo>>2]; }
+static void ftc_leaf_weight_set(struct ftc_decstate *ds, UI wo, u16 v) { ds->leaf_weight[wo>>2] = v; }
+static void ftc_parent_set(struct ftc_decstate *ds, UI child_wo, UI parent_wo, UI is_child0)
 {
 	ds->parentbit[child_wo>>2] = (u16)((parent_wo>>2) | (is_child0 ? 0x8000 : 0));
 }
 
-static u16 ftc_queue_id_get(struct ftc_decstate *ds, unsigned int i) { return ds->sort_scratch[i]; }
-static void ftc_queue_id_set(struct ftc_decstate *ds, unsigned int i, u16 v) { ds->sort_scratch[i] = v; }
-static u16 ftc_queue_id_next_get(struct ftc_decstate *ds, unsigned int i) { return ds->sort_scratch[i+1]; }
-static void ftc_queue_id_next_set(struct ftc_decstate *ds, unsigned int i, u16 v) { ds->sort_scratch[i+1] = v; }
+static u16 ftc_queue_id_get(struct ftc_decstate *ds, UI i) { return ds->sort_scratch[i]; }
+static void ftc_queue_id_set(struct ftc_decstate *ds, UI i, u16 v) { ds->sort_scratch[i] = v; }
+static u16 ftc_queue_id_next_get(struct ftc_decstate *ds, UI i) { return ds->sort_scratch[i+1]; }
+static void ftc_queue_id_next_set(struct ftc_decstate *ds, UI i, u16 v) { ds->sort_scratch[i+1] = v; }
 
 // qweight[i] holds the weight of whatever id sits at sort_scratch[i], moved
 // in lockstep on every write/swap/memmove -- needed since internal nodes,
 // once queued, have no leaf_weight entry to fall back on.
-static u16 ftc_queue_weight_get(struct ftc_decstate *ds, unsigned int i) { return ds->qweight[i]; }
-static void ftc_queue_weight_set(struct ftc_decstate *ds, unsigned int i, u16 v) { ds->qweight[i] = v; }
-static u16 ftc_queue_weight_next_get(struct ftc_decstate *ds, unsigned int i) { return ds->qweight[i+1]; }
+static u16 ftc_queue_weight_get(struct ftc_decstate *ds, UI i) { return ds->qweight[i]; }
+static void ftc_queue_weight_set(struct ftc_decstate *ds, UI i, u16 v) { ds->qweight[i] = v; }
+static u16 ftc_queue_weight_next_get(struct ftc_decstate *ds, UI i) { return ds->qweight[i+1]; }
 
 // Sorts sort_scratch[first_index .. stack_base] by weight (qweight), using a
 // hybrid quicksort (Hoare partition) / insertion-sort (spans <=16). Tie-break
 // order matters for byte-exact code assignment. The quicksort's explicit
 // recursion stack lives in sort_scratch's own tail, past stack_base.
-static void ftc_sort_range(struct ftc_decstate *ds, unsigned int stack_base, unsigned int first_index)
+static void ftc_sort_range(struct ftc_decstate *ds, UI stack_base, UI first_index)
 {
-	unsigned int stack_ptr;
+	UI stack_ptr;
 
 	ftc_queue_id_set(ds, stack_base+1, (u16)first_index);
 	ftc_queue_id_set(ds, stack_base+2, (u16)stack_base);
 	stack_ptr = stack_base + 3;
 	while(1) {
-		unsigned int hi = stack_ptr - 1;
-		unsigned int lo;
-		unsigned int next_lo, next_hi;
+		UI hi = stack_ptr - 1;
+		UI lo;
+		UI next_lo, next_hi;
 
 		stack_ptr = stack_ptr - 2;
 		lo = ftc_queue_id_get(ds, stack_ptr);
@@ -381,19 +380,19 @@ static void ftc_sort_range(struct ftc_decstate *ds, unsigned int stack_base, uns
 			next_hi = hi;
 			if(hi - lo <= 16) {
 				// ---- insertion sort (span of 16 elements or fewer) ----
-				unsigned int ins_end = lo + 1;
+				UI ins_end = lo + 1;
 
 				next_lo = hi;
 				if(ins_end <= hi) {
-					unsigned int scan_pos = ins_end;
+					UI scan_pos = ins_end;
 
 					do {
 						u16 key = ftc_queue_id_get(ds, scan_pos);
 						u16 key_w = ftc_queue_weight_get(ds, scan_pos);
-						unsigned int shift_from = lo;
+						UI shift_from = lo;
 
 						if(ftc_queue_weight_get(ds, lo) < key_w) {
-							unsigned int shift_scan = lo;
+							UI shift_scan = lo;
 
 							do {
 								if(ins_end <= shift_from) break;
@@ -402,7 +401,7 @@ static void ftc_sort_range(struct ftc_decstate *ds, unsigned int stack_base, uns
 							} while(ftc_queue_weight_get(ds, shift_scan) < key_w);
 						}
 						{
-							unsigned int shift_len = ins_end - shift_from;
+							UI shift_len = ins_end - shift_from;
 
 							if(shift_len>0) {
 								de_memmove(&ds->sort_scratch[shift_from+1],
@@ -422,10 +421,10 @@ static void ftc_sort_range(struct ftc_decstate *ds, unsigned int stack_base, uns
 			}
 			else {
 				// ---- Hoare partition (span >= 17 elements) ----
-				unsigned int pivot_idx = (hi + lo) >> 1;
+				UI pivot_idx = (hi + lo) >> 1;
 				u16 pivot_weight = ftc_queue_weight_get(ds, pivot_idx);
-				unsigned int left = lo;
-				unsigned int right = hi;
+				UI left = lo;
+				UI right = hi;
 
 				do {
 					if(ftc_queue_weight_get(ds, left) < pivot_weight) {
@@ -479,15 +478,15 @@ static void ftc_sort_range(struct ftc_decstate *ds, unsigned int stack_base, uns
 // only for the all-zero-weights case (never valid encoder output).
 static int ftc_build_tree(struct ftc_decstate *ds)
 {
-	unsigned int num_leaves = 0, unit_weight_count = 0;
-	unsigned int unit_chain_idx = 0;
-	unsigned int last_nonunit_node = 0;
-	unsigned int wo;
-	unsigned int next_internal_node;
-	unsigned int front;
+	UI num_leaves = 0, unit_weight_count = 0;
+	UI unit_chain_idx = 0;
+	UI last_nonunit_node = 0;
+	UI wo;
+	UI next_internal_node;
+	UI front;
 
 	for(wo=0; wo<FTC_LEAF_LIMIT_WO; wo+=4) {
-		unsigned int carry_node = wo;
+		UI carry_node = wo;
 		u16 w;
 
 		w = ftc_leaf_weight_get(ds, wo);
@@ -522,7 +521,7 @@ static int ftc_build_tree(struct ftc_decstate *ds)
 	// Populate qweight for the whole queue (leaf ids only, at this point)
 	// from leaf_weight before sort/merge take over co-located tracking.
 	{
-		unsigned int qi;
+		UI qi;
 
 		for(qi=0; qi<num_leaves; qi++) {
 			ftc_queue_weight_set(ds, qi, ftc_leaf_weight_get(ds, ftc_queue_id_get(ds, qi)));
@@ -534,11 +533,11 @@ static int ftc_build_tree(struct ftc_decstate *ds)
 	next_internal_node = FTC_LEAF_LIMIT_WO;
 	front = 0;
 	if(num_leaves!=2) {
-		unsigned int remaining = num_leaves;
+		UI remaining = num_leaves;
 
 		do {
 			u16 child0, child1;
-			unsigned int search_lo, mid, search_hi, insert_pos;
+			UI search_lo, mid, search_hi, insert_pos;
 			u16 merged_weight;
 
 			remaining--;
@@ -565,7 +564,7 @@ static int ftc_build_tree(struct ftc_decstate *ds)
 				} while(cont);
 			}
 			{
-				unsigned int shift_count = (insert_pos - 1) - front;
+				UI shift_count = (insert_pos - 1) - front;
 
 				if((int)shift_count > 0) {
 					de_memmove(&ds->sort_scratch[front],
@@ -604,12 +603,12 @@ static int ftc_build_tree(struct ftc_decstate *ds)
 // a child0/child1 table. Registers each leaf's index (node>>2) as the value.
 static void ftc_emit_codes(struct ftc_decstate *ds, struct fmtutil_huffman_decoder *hd)
 {
-	unsigned int wo;
+	UI wo;
 
 	for(wo=0; wo<FTC_LEAF_LIMIT_WO; wo+=4) {
 		u64 code = 0;
-		unsigned int nbits = 0;
-		unsigned int cur = wo;
+		UI nbits = 0;
+		UI cur = wo;
 
 		if(ds->parentbit[wo>>2]==0) continue;
 		while(1) {
@@ -619,7 +618,7 @@ static void ftc_emit_codes(struct ftc_decstate *ds, struct fmtutil_huffman_decod
 			if(nbits >= FMTUTIL_HUFFMAN_MAX_CODE_LENGTH) { ds->emit_failed = 1; break; }
 			code |= ((u64)((pb & 0x8000) ? 1 : 0)) << nbits;
 			nbits++;
-			cur = (unsigned int)(pb & 0x7fff) << 2;
+			cur = (UI)(pb & 0x7fff) << 2;
 		}
 		if(ds->emit_failed) return;
 		if(!fmtutil_huffman_add_code(ds->c, hd->bk, code, nbits, (fmtutil_huffman_valtype)(wo>>2))) {
@@ -656,11 +655,11 @@ static int ftc_build_decoder(struct ftc_decstate *ds, struct fmtutil_huffman_dec
 // builds a tree. ftc_scale_frequencies (below) always uses this for Table A;
 // for Table B only when the model bytes lack a "mirror" symmetry -- otherwise
 // dec_b just aliases dec_a.
-static int ftc_compute_scaled_freq(struct ftc_decstate *ds, unsigned int mult0, unsigned int mult1)
+static int ftc_compute_scaled_freq(struct ftc_decstate *ds, UI mult0, UI mult1)
 {
-	unsigned int i;
+	UI i;
 	u16 max_w = 0;
-	unsigned int scale;
+	UI scale;
 
 	de_zeromem(ds->parentbit, sizeof(ds->parentbit));
 	de_zeromem(ds->leaf_weight, sizeof(ds->leaf_weight));
@@ -668,7 +667,7 @@ static int ftc_compute_scaled_freq(struct ftc_decstate *ds, unsigned int mult0, 
 		u16 raw = ds->raw_weights[i];
 
 		if(raw!=0) {
-			unsigned int mult = (ds->tbls->ftc_type_table[i]==0) ? mult0 : mult1;
+			UI mult = (ds->tbls->ftc_type_table[i]==0) ? mult0 : mult1;
 			u16 v = (u16)((raw * mult) & 0xffff);
 
 			ftc_leaf_weight_set(ds, i*4, v);
@@ -678,11 +677,11 @@ static int ftc_compute_scaled_freq(struct ftc_decstate *ds, unsigned int mult0, 
 	scale = 0;
 	if(max_w >= 0x100) scale = 0xffffU / max_w;
 	if(scale!=0) {
-		unsigned int wo;
+		UI wo;
 
 		for(wo=0; wo<FTC_LEAF_LIMIT_WO; wo+=4) {
 			u16 w = ftc_leaf_weight_get(ds, wo);
-			unsigned int v = (w * scale) >> 8;
+			UI v = (w * scale) >> 8;
 
 			if(w!=0 && v==0) v = 1;
 			ftc_leaf_weight_set(ds, wo, (u16)v);
@@ -716,14 +715,14 @@ static int ftc_scale_frequencies(struct ftc_decstate *ds)
 
 // On a mode change, patches the shared ftc_type_table[320]/
 // ftc_extrastep_table[64] globals and (re)builds dec_digitchain. A
-// single-slot cache, not one per mode: real files never toggle mode within a
-// member, so a toggle just costs a rebuild (still correct, just not free).
+// single-slot cache, not one per mode: real files never toggle mode within an
+// item, so a toggle just costs a rebuild (still correct, just not free).
 // The globals are safe to patch in place: fmtutil_ftcomp_codectype1
 // re-unpacks them fresh at the top of every call, and calls are never nested
-// or concurrent, so there's no cross-call or cross-member leakage.
-static int ftc_ensure_digitchain_decoder(struct ftc_decstate *ds, unsigned int mode)
+// or concurrent, so there's no cross-call or cross-item leakage.
+static int ftc_ensure_digitchain_decoder(struct ftc_decstate *ds, UI mode)
 {
-	unsigned int i;
+	UI i;
 
 	ds->mode = mode;
 	if(ds->last_mode==mode) return 1;
@@ -771,8 +770,8 @@ static int ftc_ensure_digitchain_decoder(struct ftc_decstate *ds, unsigned int m
 #define FTC_CS_CHAIN_TERMINAL 6
 
 // --- Stream-position tracking for the digit-chain width gate ---------------
-// ds->stream_pos is the exact count of decompressed bytes produced by the
-// member so far, seeded from FTC_PRESET_DICT_LEN and advanced by each
+// ds->stream_pos is the exact count of decompressed bytes produced
+// so far, seeded from FTC_PRESET_DICT_LEN and advanced by each
 // block's real (stage-2-measured) length in ftc_decode_block -- never by
 // the per-symbol estimate below.
 // st->stream_pos_est is a working copy taken from ds->stream_pos at the
@@ -790,8 +789,8 @@ static int ftc_ensure_digitchain_decoder(struct ftc_decstate *ds, unsigned int m
 #define FTC_STREAM_POS_DISABLED  0x40000000u
 
 struct ftc_stage1state {
-	unsigned int chain_state;
-	unsigned int table_sel; // 0 -> dec_a (Table A); nonzero -> dec_b (Table B)
+	UI chain_state;
+	UI table_sel; // 0 -> dec_a (Table A); nonzero -> dec_b (Table B)
 
 	// This block's running estimate; see the stream-position comment
 	// above FTC_STREAM_POS_THRESH1.
@@ -799,11 +798,11 @@ struct ftc_stage1state {
 
 	// Chosen digit-chain form (0/1/2); persists stale across unrelated
 	// sequences, reassigned only by the non-chain_alt_flag branch.
-	unsigned int last_digit_form;
+	UI last_digit_form;
 
 	// Set when a length-class symbol's extra_step_table offset is exactly
 	// 0x40 and mode>=FT21; selects a simpler 2-bit read for the next sequence.
-	unsigned int chain_alt_flag;
+	UI chain_alt_flag;
 
 	struct ftc_mrurank mtf_single; // chain_state===SINGLE site
 	struct ftc_mrurank mtf_form0;  // form-class 0 (shift_amt=4, +0x10)
@@ -843,8 +842,8 @@ static void ftc_stage1state_init(struct ftc_stage1state *st, struct ftc_decstate
 // table_sel/chain_state; chain_alt_flag only in the length-class branch.
 static void ftc_read_fresh(struct ftc_stage1state *st, struct ftc_decstate *ds, struct de_bitreader *br, dbuf *out)
 {
-	unsigned int chain_state = FTC_CS_FRESH;
-	unsigned int sym;
+	UI chain_state = FTC_CS_FRESH;
+	UI sym;
 	u32 gate_delta = 0;
 	// out's length before this symbol's own writes below -- needed (not just
 	// dbuf_get_length(out) inline) because some branches read this position
@@ -852,7 +851,7 @@ static void ftc_read_fresh(struct ftc_stage1state *st, struct ftc_decstate *ds, 
 	i64 pos_before = dbuf_get_length(out);
 
 	sym = ftc_br_read_sym(br, (st->table_sel==0) ? ds->dec_a : ds->dec_b);
-	st->table_sel = (unsigned int)ds->tbls->ftc_type_table[sym];
+	st->table_sel = (UI)ds->tbls->ftc_type_table[sym];
 
 	if(sym < FTC_SYM_LENCLASS_START) {
 		gate_delta = 1;
@@ -862,13 +861,13 @@ static void ftc_read_fresh(struct ftc_stage1state *st, struct ftc_decstate *ds, 
 		}
 	}
 	else if(sym < FTC_SYM_RECENTWORD_START) {
-		unsigned int len_class_offset = sym - FTC_SYM_LENCLASS_START;
+		UI len_class_offset = sym - FTC_SYM_LENCLASS_START;
 		u8 escbuf[2];
 
 		escbuf[0] = FTC_LZESCAPE_BYTE;
 		escbuf[1] = (u8)len_class_offset;
 		dbuf_write(out, escbuf, 2);
-		chain_state = (unsigned int)ds->tbls->ftc_extrastep_table[len_class_offset];
+		chain_state = (UI)ds->tbls->ftc_extrastep_table[len_class_offset];
 		if(chain_state != FTC_CS_FRESH) {
 			if(chain_state <= FTC_CS_COMBINE) gate_delta = (len_class_offset & 0x3f) + 3;
 			st->chain_alt_flag = (len_class_offset==0x40 && ds->mode>=FTC_MODE_FT21) ? 1 : 0;
@@ -879,7 +878,7 @@ static void ftc_read_fresh(struct ftc_stage1state *st, struct ftc_decstate *ds, 
 		// Short-lookback replay: word_val comes from output bytes already
 		// written a few positions back (sym==385 -> last 2 bytes, ...,
 		// sym==400 -> 17 back), then cached into ring_matchdist for reuse.
-		unsigned int word_val = (unsigned int)dbuf_getu16le(out, pos_before + 383 - (i64)sym);
+		UI word_val = (UI)dbuf_getu16le(out, pos_before + 383 - (i64)sym);
 
 		dbuf_writeu16le(out, word_val);
 		gate_delta = ((word_val & 0xff)==FTC_LZESCAPE_BYTE) ? 1 : 2;
@@ -891,7 +890,7 @@ static void ftc_read_fresh(struct ftc_stage1state *st, struct ftc_decstate *ds, 
 		//   src0==0x80: 0x9E + length byte + 2-byte distance (4 payload bytes)
 		//   src0&0x40:  0x9E + 1 extra byte + 2-byte distance (3 payload bytes)
 		//   otherwise:  0x9E + 2-byte distance (2 payload bytes)
-		unsigned int n_words = sym - FTC_SYM_LENPOS_START;
+		UI n_words = sym - FTC_SYM_LENPOS_START;
 		i64 src_pos = ftc_mruring_peek(&ds->ring_lenpos, n_words);
 		i64 pair;
 		u8 src0;
@@ -920,8 +919,8 @@ static void ftc_read_fresh(struct ftc_stage1state *st, struct ftc_decstate *ds, 
 	else {
 		// MRU-ring replay of a word_val previously cached by the
 		// short-lookback class above.
-		unsigned int n_words = sym - FTC_SYM_MATCHDIST_START;
-		unsigned int word_val = ftc_mruring_peek(&ds->ring_matchdist, n_words);
+		UI n_words = sym - FTC_SYM_MATCHDIST_START;
+		UI word_val = ftc_mruring_peek(&ds->ring_matchdist, n_words);
 
 		dbuf_writeu16le(out, word_val);
 		gate_delta = ((word_val & 0xff)==FTC_LZESCAPE_BYTE) ? 1 : 2;
@@ -940,13 +939,13 @@ static void ftc_read_fresh(struct ftc_stage1state *st, struct ftc_decstate *ds, 
 static void ftc_read_chain_continuation(struct ftc_stage1state *st, struct ftc_decstate *ds,
 	struct de_bitreader *br, dbuf *out)
 {
-	unsigned int chain_state = st->chain_state;
+	UI chain_state = st->chain_state;
 	u32 gate_delta = 0;
 
 	if(chain_state > FTC_CS_COMBINE) {
 		// One more raw digit-chain step: the final (TERMINAL) step
 		// un-ranks via MTF; every earlier step just remaps per mode.
-		unsigned int digit = ftc_br_read_sym(br, ds->dec_digitchain);
+		UI digit = ftc_br_read_sym(br, ds->dec_digitchain);
 
 		chain_state = chain_state + 1;
 		if(chain_state==FTC_CS_CHAIN_TERMINAL) {
@@ -966,8 +965,8 @@ static void ftc_read_chain_continuation(struct ftc_stage1state *st, struct ftc_d
 		dbuf_writebyte(out, (u8)(digit & 0xff));
 	}
 	else {
-		unsigned int immediate = 0, form_sel = 0;
-		unsigned int digit;
+		UI immediate = 0, form_sel = 0;
+		UI digit;
 
 		if(chain_state==FTC_CS_COMBINE) {
 			// 9-bit lookahead: w9 bit8 = next unconsumed bit, bit7 = 2nd,
@@ -976,7 +975,7 @@ static void ftc_read_chain_continuation(struct ftc_stage1state *st, struct ftc_d
 			// nbits_in_bitbuf back up by (9-width) below un-consumes
 			// whatever w9 bits this branch didn't end up using.
 			u32 w9 = (u32)de_bitreader_getbits(br, 9);
-			unsigned int width;
+			UI width;
 
 			// Variable-length prefix code, gated by stream_pos_est:
 			//   chain_alt_flag set     : 2 bits immediate; form = last_digit_form (reused)
@@ -1021,7 +1020,7 @@ static void ftc_read_chain_continuation(struct ftc_stage1state *st, struct ftc_d
 		}
 		digit = ftc_br_read_sym(br, ds->dec_digitchain);
 		if(chain_state==FTC_CS_SINGLE) {
-			unsigned int unranked = ftc_mrurank_unrank(&st->mtf_single, digit, ds->mode);
+			UI unranked = ftc_mrurank_unrank(&st->mtf_single, digit, ds->mode);
 
 			dbuf_writebyte(out, (u8)(unranked & 0xff));
 		}
@@ -1029,7 +1028,7 @@ static void ftc_read_chain_continuation(struct ftc_stage1state *st, struct ftc_d
 			// Combines the MRU-unranked digit-class value (offset by a
 			// per-form base) with the immediate field:
 			// ((unranked + base) << shift_amt) + immediate.
-			unsigned int shift_amt, base, unranked;
+			UI shift_amt, base, unranked;
 			u32 assembled;
 
 			if(st->chain_alt_flag) {
@@ -1071,13 +1070,13 @@ static void ftc_read_chain_continuation(struct ftc_stage1state *st, struct ftc_d
 static dbuf *ftc_decode_stage1(deark *c, struct ftc_decstate *ds, dbuf *f, i64 body_base, i64 body_len,
 	i64 block_start, i64 *new_pos)
 {
-	unsigned int len_field;
+	UI len_field;
 	dbuf *out;
 	struct de_bitreader br;
 	struct ftc_stage1state st;
-	unsigned int sym;
+	UI sym;
 
-	len_field = (unsigned int)dbuf_getu16le(f, body_base+block_start);
+	len_field = (UI)dbuf_getu16le(f, body_base+block_start);
 
 	if(len_field==0xffff) {
 		i64 raw_len = dbuf_getu16le(f, body_base+block_start+2);
@@ -1110,10 +1109,10 @@ static dbuf *ftc_decode_stage1(deark *c, struct ftc_decstate *ds, dbuf *f, i64 b
 	// ---- descriptor decode: 433 symbols via the fixed descriptor tree ----
 	sym = 0;
 	while(sym < FTC_DESCRIPTORTABLE_LEN) {
-		unsigned int val = ftc_br_read_sym(&br, ds->dec_descriptor);
+		UI val = ftc_br_read_sym(&br, ds->dec_descriptor);
 
 		if(val==0x100) {
-			unsigned int n = 0;
+			UI n = 0;
 
 			while(1) {
 				if(sym+n > FTC_DESCRIPTORTABLE_LEN-1) break;
@@ -1151,34 +1150,25 @@ static dbuf *ftc_decode_stage1(deark *c, struct ftc_decstate *ds, dbuf *f, i64 b
 }
 
 // ===========================================================================
-// STAGE 2 (chunks -> raw bytes). `ring` is the real, member-wide LZ history:
-// a de_lz77buffer seeded from ftc_preset_dict and never reset between
-// blocks, sized (see fmtutil_ftcomp_codectype1) to fit the whole member's
-// output, so curpos advances monotonically and never wraps -- each block's
-// output is one contiguous `ring->buf` slice, and cross-block back-references
-// resolve through the same buffer.
-//
-// `cap_limit` hardens against a lying orig_len header exhausting memory:
-// ring is pre-sized at least that large, so it's normally never hit; it
-// exists so a corrupt/adversarial stream that tries to write past it fails
-// cleanly (sticky `failed`) instead of wrapping curpos and corrupting
-// earlier blocks' output.
+// STAGE 2 (chunks -> raw bytes).
 // ===========================================================================
-// hb->ring's writebyte_cb: tracks the running per-member total and sets
-// sticky `failed` once it would exceed cap_limit (see the struct comment above).
 static void ftc_hist_append_cb(struct de_lz77buffer *rb, u8 val)
 {
-	struct ftc_histbuf *hb = (struct ftc_histbuf*)rb->userdata;
+	struct ftc_stage2state *hb = (struct ftc_stage2state*)rb->userdata;
 
-	(void)val;
 	if(hb->failed) return;
 	hb->total_len++;
-	if(hb->total_len > hb->cap_limit) hb->failed = 1;
+	if(hb->total_len > hb->cap_limit) {
+		hb->failed = 1;
+	}
+	else {
+		dbuf_writebyte(hb->outf, val);
+	}
 }
 
 // ===========================================================================
 // Stage-2 LZ77 expander over one 0x9E-escape-coded chunk body, appending
-// into `hb`'s history ring at its current position (matches are member-wide,
+// into `hb`'s history ring at its current position (matches are item-wide,
 // not chunk-local -- the ring is never re-seeded between blocks). A non-0x9E
 // byte is a literal; 0x9E starts an escape sequence, whose next byte (`flag`)
 // selects one of 4 forms:
@@ -1193,12 +1183,11 @@ static void ftc_hist_append_cb(struct de_lz77buffer *rb, u8 val)
 // clamp only against stage1_out's overall length, not src_len -- a real but
 // wrong-chunk byte on a truncated chunk, never an OOB access.
 // ===========================================================================
-static i64 ftc_lz_expand(struct ftc_histbuf *hb, i64 dest_off, dbuf *stage1_out, i64 src_pos, i64 src_len,
-	unsigned int mode)
+static void ftc_lz_expand(struct ftc_stage2state *hb, dbuf *stage1_out,
+	i64 src_pos, i64 src_len, UI mode)
 {
 	u8 lit_esc_byte = (mode>=FTC_MODE_FT21) ? 0xff : 0x40;
 	i64 s = 0;
-	i64 d = dest_off;
 
 	while(!hb->failed && s<src_len) {
 		u8 cur_byte = dbuf_getbyte(stage1_out, src_pos+s);
@@ -1207,7 +1196,7 @@ static i64 ftc_lz_expand(struct ftc_histbuf *hb, i64 dest_off, dbuf *stage1_out,
 
 		if(cur_byte != FTC_LZESCAPE_BYTE) {
 			de_lz77buffer_add_literal_byte(hb->ring, cur_byte);
-			d++; s++;
+			s++;
 			continue;
 		}
 
@@ -1215,7 +1204,6 @@ static i64 ftc_lz_expand(struct ftc_histbuf *hb, i64 dest_off, dbuf *stage1_out,
 
 		if(flag==lit_esc_byte) {
 			de_lz77buffer_add_literal_byte(hb->ring, FTC_LZESCAPE_BYTE);
-			d++;
 			s += 2;
 		}
 		else if(flag==0x80) {
@@ -1223,8 +1211,7 @@ static i64 ftc_lz_expand(struct ftc_histbuf *hb, i64 dest_off, dbuf *stage1_out,
 
 			len = (i64)len_byte + 0x43;
 			dist = dbuf_getu16le(stage1_out, src_pos+s+3);
-			de_lz77buffer_copy_from_hist(hb->ring, (UI)(d-1-dist), (UI)len);
-			d += len;
+			de_lz77buffer_copy_from_hist(hb->ring, (UI)(hb->ring->curpos-1-dist), (UI)len);
 			s += 5;
 		}
 		else if((flag & 0x40)==0) {
@@ -1232,26 +1219,23 @@ static i64 ftc_lz_expand(struct ftc_histbuf *hb, i64 dest_off, dbuf *stage1_out,
 
 			len = (i64)flag + 3;
 			dist = (i64)dist_byte;
-			de_lz77buffer_copy_from_hist(hb->ring, (UI)(d-1-dist), (UI)len);
-			d += len;
+			de_lz77buffer_copy_from_hist(hb->ring, (UI)(hb->ring->curpos-1-dist), (UI)len);
 			s += 3;
 		}
 		else {
 			len = ((i64)flag & 0x3f) + 3;
 			dist = dbuf_getu16le(stage1_out, src_pos+s+2);
-			de_lz77buffer_copy_from_hist(hb->ring, (UI)(d-1-dist), (UI)len);
-			d += len;
+			de_lz77buffer_copy_from_hist(hb->ring, (UI)(hb->ring->curpos-1-dist), (UI)len);
 			s += 4;
 		}
 	}
-	return d - dest_off;
 }
 
 // Walks Stage-1 output as u16-length-prefixed chunks (length includes the
 // chunk's own flag byte). Flag byte 0 means already-literal; otherwise
 // chunk[1..] is escape-coded, expanded via ftc_lz_expand. Both paths append
 // into `hb`'s ring so back-references reach across chunk/block boundaries.
-static void ftc_decode_stage2(struct ftc_histbuf *hb, dbuf *stage1_out, unsigned int mode)
+static void ftc_decode_stage2(struct ftc_stage2state *hb, dbuf *stage1_out, UI mode)
 {
 	i64 stage1_len = dbuf_get_length(stage1_out);
 	i64 p = 0;
@@ -1276,7 +1260,7 @@ static void ftc_decode_stage2(struct ftc_histbuf *hb, dbuf *stage1_out, unsigned
 			}
 		}
 		else {
-			ftc_lz_expand(hb, (i64)hb->ring->curpos, stage1_out, chunk_body_pos+1, body_len, mode);
+			ftc_lz_expand(hb, stage1_out, chunk_body_pos+1, body_len, mode);
 		}
 	}
 }
@@ -1289,7 +1273,17 @@ static void ftc_fail(struct ftc_ctx *ctx, const char *msg)
 {
 	if(ctx->failed) return;
 	ctx->failed = 1;
-	de_dfilter_set_errorf(ctx->c, ctx->dres, ctx->modname, "%s", msg);
+	if(msg) {
+		de_dfilter_set_errorf(ctx->c, ctx->dres, ctx->modname, "%s", msg);
+	}
+	else {
+		de_dfilter_set_generic_error(ctx->c, ctx->dres, ctx->modname);
+	}
+}
+
+static void ftc_fail_internal(struct ftc_ctx *ctx)
+{
+	ftc_fail(ctx, "Internal error");
 }
 
 // fT21-only RLE/MTF post-pass over one block's raw Stage-2 output (`buf`,
@@ -1308,50 +1302,44 @@ static void ftc_fail(struct ftc_ctx *ctx, const char *msg)
 // `marker` occurrences: the next control byte is looked up; rank 0xff means
 // "not a real run" (marker emitted literally), otherwise the following byte
 // is repeated rank+4 times. Streams its result directly to ctx->dcmpro->f.
-static void ftc_rle21(struct ftc_ctx *ctx, const u8 *buf, i64 total)
+static void ftc_rle21(struct ftc_ctx *ctx, dbuf *input, i64 total)
 {
-	dbuf *input;
 	u8 marker;
 	i64 cnt, tail_start;
 	i64 p, src_pos, tail_pos;
 
-	if(ctx->failed) return;
-
-	input = dbuf_create_membuf(ctx->c, total, 0);
-	dbuf_write(input, buf, total);
+	if(ctx->failed) goto done;
 
 	marker = dbuf_getbyte(input, 0);
 	if(marker==0xff) {
 		if(total>1) dbuf_copy(input, 1, total-1, ctx->dcmpro->f);
-		dbuf_close(input);
-		return;
+		goto done;
 	}
 
 	cnt = dbuf_getu16le(input, 1);
 	if(cnt > total) {
-		ftc_fail(ctx, "RLE21: control region count out of bounds");
-		dbuf_close(input);
-		return;
+		ftc_fail(ctx, NULL); // "RLE21: control region count out of bounds"
+		goto done;
 	}
 	tail_start = (total - cnt) & 0xffff;
 
 	for(p=0; p<256; p++) {
-		ftc_queue_id_set(&ctx->dec, (unsigned int)p, (u16)(p*4));
-		ftc_leaf_weight_set(&ctx->dec, (unsigned int)(p*4), 0);
+		ftc_queue_id_set(&ctx->dec, (UI)p, (u16)(p*4));
+		ftc_leaf_weight_set(&ctx->dec, (UI)(p*4), 0);
 	}
 	for(p=0; p<tail_start; p++) {
 		u8 b = dbuf_getbyte(input, p);
 
-		ftc_leaf_weight_set(&ctx->dec, (unsigned int)b*4, ftc_leaf_weight_get(&ctx->dec, (unsigned int)b*4) + 1);
+		ftc_leaf_weight_set(&ctx->dec, (UI)b*4, ftc_leaf_weight_get(&ctx->dec, (UI)b*4) + 1);
 	}
 	// queue_id(p)==p*4 (identity, set above) still holds here, so leaf_weight
 	// keyed by byte value doubles as qweight keyed by queue position.
 	for(p=0; p<256; p++) {
-		ftc_queue_weight_set(&ctx->dec, (unsigned int)p, ftc_leaf_weight_get(&ctx->dec, (unsigned int)(p*4)));
+		ftc_queue_weight_set(&ctx->dec, (UI)p, ftc_leaf_weight_get(&ctx->dec, (UI)(p*4)));
 	}
 	ftc_sort_range(&ctx->dec, 0xff, 0);
 	for(p=0; p<256; p++) {
-		u16 byte_val = ftc_queue_id_get(&ctx->dec, (unsigned int)p);
+		u16 byte_val = ftc_queue_id_get(&ctx->dec, (UI)p);
 
 		ftc_leaf_weight_set(&ctx->dec, byte_val, (u16)(0xff - p));
 	}
@@ -1374,7 +1362,7 @@ static void ftc_rle21(struct ftc_ctx *ctx, const u8 *buf, i64 total)
 			u16 rank;
 
 			tail_pos++;
-			rank = ftc_leaf_weight_get(&ctx->dec, (unsigned int)ctrl*4);
+			rank = ftc_leaf_weight_get(&ctx->dec, (UI)ctrl*4);
 			if(rank==0xff) {
 				dbuf_writebyte(ctx->dcmpro->f, marker);
 			}
@@ -1388,64 +1376,78 @@ static void ftc_rle21(struct ftc_ctx *ctx, const u8 *buf, i64 total)
 		}
 		src_pos++;
 	}
-	dbuf_close(input);
+done:;
 }
 
 // Decodes one framed fT19/fT21 block starting at *pos (right after its tag),
 // emits its output, and advances *pos. ctx->dec is intentionally NOT reset
-// between blocks -- the adaptive Huffman state / MRU rings persist across a
-// member; only the transmitted descriptor is rebuilt fresh each block.
-// Cross-block LZ back-references resolve through ctx->hb.ring, a persistent
-// window spanning the whole member.
-static void ftc_decode_block(struct ftc_ctx *ctx, i64 *pos, unsigned int mode)
+// between blocks -- the adaptive Huffman state / MRU rings persist across an
+// item; only the transmitted descriptor is rebuilt fresh each block.
+// Cross-block LZ back-references resolve through ctx->hb.ring.
+static void ftc_decode_block(struct ftc_ctx *ctx, i64 blkpos, i64 *ppos, UI mode)
 {
 	dbuf *stage1_out;
 	i64 new_pos = 0;
-	i64 block_start_pos;
 	i64 block_len;
 
 	if(ctx->failed) return;
-	if(!ftc_ensure_digitchain_decoder(&ctx->dec, mode)) { ftc_fail(ctx, "internal Huffman tree build failure"); return; }
+	de_dbg2(ctx->c, "block at %"I64_FMT", mode=%u", blkpos, mode);
 
-	stage1_out = ftc_decode_stage1(ctx->c, &ctx->dec, ctx->inf, ctx->inf_pos1, ctx->inf_len, *pos, &new_pos);
-	if(!stage1_out) { ftc_fail(ctx, "Stage-1 decode failed (corrupt data)"); return; }
+	if(!ftc_ensure_digitchain_decoder(&ctx->dec, mode)) {
+		ftc_fail_internal(ctx); // "internal Huffman tree build failure"
+		return;
+	}
 
-	block_start_pos = (i64)ctx->hb.ring->curpos;
+	stage1_out = ftc_decode_stage1(ctx->c, &ctx->dec, ctx->inf, ctx->inf_pos1, ctx->inf_len, *ppos, &new_pos);
+	if(!stage1_out) {
+		ftc_fail(ctx, NULL); // "Stage-1 decode failed (corrupt data)"
+		return;
+	}
+
+	if(!ctx->hb.outf) {
+		ctx->hb.outf = dbuf_create_membuf(ctx->c, 0, 0);
+		dbuf_enable_wbuffer(ctx->hb.outf);
+	}
+	dbuf_empty(ctx->hb.outf);
+
 	ftc_decode_stage2(&ctx->hb, stage1_out, mode);
 	dbuf_close(stage1_out);
+	dbuf_flush(ctx->hb.outf);
 
-	if(ctx->hb.failed) { ftc_fail(ctx, "Stage-2 expansion failed (corrupt data, or output too large)"); return; }
+	if(ctx->hb.failed) {
+		ftc_fail(ctx, NULL); // "Stage-2 expansion failed (corrupt data, or output too large)"
+		return;
+	}
 
-	// ring never wraps over a member's lifetime (see fmtutil_ftcomp_codectype1),
-	// so this block's bytes are exactly ring->buf[block_start_pos, curpos).
-	block_len = (i64)ctx->hb.ring->curpos - block_start_pos;
+	block_len = ctx->hb.outf->len;
 
 	// Folds this block's measured output length into stream_pos, which seeds
 	// the NEXT block's digit-chain bit-field-width gate (fT19 never uses it).
 	ctx->dec.stream_pos += (u32)block_len;
 
-	*pos = new_pos;
+	*ppos = new_pos;
 
 	if(mode>=FTC_MODE_FT21) {
-		ftc_rle21(ctx, &ctx->hb.ring->buf[block_start_pos], block_len);
+		ftc_rle21(ctx, ctx->hb.outf, ctx->hb.outf->len);
 	}
 	else {
-		dbuf_write(ctx->dcmpro->f, &ctx->hb.ring->buf[block_start_pos], block_len);
+		dbuf_copy(ctx->hb.outf, 0, ctx->hb.outf->len, ctx->dcmpro->f);
 	}
 }
 
-// Top-level per-member pipeline: loops over ftc_decode_block until the tag
+// Top-level pipeline: loops over ftc_decode_block until the tag
 // stops matching -- there's no outer length field. Skips the leading 4-byte
 // stream-marker; the first tag after it MUST be fT19/fT21, but every later
 // non-match just means "no more blocks".
-static void ftc_decode_member(struct ftc_ctx *ctx)
+static void ftc_decode_item_main(struct ftc_ctx *ctx)
 {
 	i64 pos = 4;
 	i64 iter = 0;
 
 	while(pos+4 <= ctx->inf_len) {
-		unsigned int mode;
+		UI mode;
 		struct de_fourcc tag4cc;
+		i64 blkpos =  ctx->inf_pos1 + pos;
 
 		dbuf_read_fourcc(ctx->inf, ctx->inf_pos1+pos, &tag4cc, 4, 0x0);
 		if(tag4cc.id==CODE_fT21) mode = FTC_MODE_FT21;
@@ -1453,23 +1455,25 @@ static void ftc_decode_member(struct ftc_ctx *ctx)
 		else break;
 		pos += 4;
 
-		ftc_decode_block(ctx, &pos, mode);
-		if(ctx->failed) return;
+		ftc_decode_block(ctx, blkpos, &pos, mode);
+		if(ctx->failed) goto done;
 
 		iter++;
 	}
 
 	if(iter==0) {
 		// No tag matched at all. If the leftover bytes are exactly the
-		// expected output size, it's a "stored" member -- marker + raw
+		// expected output size, it's a "stored" item -- marker + raw
 		// bytes, no fT19/fT21 tag (used when compressing wouldn't help).
 		if((ctx->inf_len-pos)==ctx->dcmpro->expected_len) {
+			de_dbg(ctx->c, "[compression=stored]");
 			dbuf_copy(ctx->inf, ctx->inf_pos1+pos, ctx->inf_len-pos, ctx->dcmpro->f);
 		}
 		else {
 			ftc_fail(ctx, "Missing fT19/fT21 tag");
 		}
 	}
+done:;
 }
 
 // ===========================================================================
@@ -1480,8 +1484,7 @@ void fmtutil_ftcomp_codectype1(deark *c, struct de_dfilter_in_params *dcmpri,
 	void *codec_private_params)
 {
 	struct ftc_ctx *ctx = NULL;
-	i64 ring_bufsize;
-	unsigned int i;
+	UI i;
 
 	ctx = de_malloc(c, sizeof(struct ftc_ctx));
 	ctx->c = c;
@@ -1497,50 +1500,36 @@ void fmtutil_ftcomp_codectype1(deark *c, struct de_dfilter_in_params *dcmpri,
 	ctx->inf = dcmpri->f;
 	ctx->inf_pos1 = dcmpri->pos;
 	ctx->inf_len = dcmpri->len;
-	// Sanity ceiling for ctx->hb growth, so a lying orig_len header can't
-	// exhaust memory: expected size plus a small margin. The DE_MAX_MALLOC
-	// clamp keeps the ring_bufsize doubling loop below from an unbounded header value.
 	ctx->hb.cap_limit = dcmpro->expected_len + 1024;
-	if(ctx->hb.cap_limit > DE_MAX_MALLOC) ctx->hb.cap_limit = DE_MAX_MALLOC;
 
 	ctx->dec.c = c;
 
 	acquire_ftctables(c, &ctx->dec);
 
-	// ring_bufsize: a power of 2 (for the ring's mask-based addressing) big
-	// enough to hold a whole member's decompressed output without wrapping.
-	ring_bufsize = FTC_LZWINDOW_LEN;
-	while(ring_bufsize < ctx->hb.cap_limit) ring_bufsize *= 2;
-	ctx->hb.ring = de_lz77buffer_create(c, (UI)ring_bufsize);
+	ctx->hb.ring = de_lz77buffer_create(c, FTC_LZWINDOW_LEN);
 	ctx->hb.ring->writebyte_cb = ftc_hist_append_cb;
 	ctx->hb.ring->userdata = (void*)&ctx->hb;
 
-	// Zero-fill the ring, then overlay ftc_preset_dict at its tail end
-	// (behind curpos 0). Via the ring's own mod-bufsize wraparound, a match
-	// distance reaching before the member's first byte resolves into the
-	// dict (nearest byte first); reaching further back resolves to 0. Since
-	// dist<=65535, the deepest reach (d=0, dist=65535) lands at
-	// ring_bufsize-65536 -- real position 0, or the zero-filled gap below
-	// the dict when ring_bufsize is larger -- never past position 0.
-	de_lz77buffer_clear(ctx->hb.ring, 0x00);
-	de_memcpy(&ctx->hb.ring->buf[ring_bufsize - FTC_PRESET_DICT_LEN], ctx->dec.tbls->ftc_preset_dict,
+	// Initialize the ring buffer with ftc_preset_dict.
+	de_memcpy(&ctx->hb.ring->buf[0], ctx->dec.tbls->ftc_preset_dict,
 		(size_t)FTC_PRESET_DICT_LEN);
+	de_lz77buffer_set_curpos(ctx->hb.ring, FTC_PRESET_DICT_LEN);
 
 	// One-time init: builds the descriptor tree from ftc_descriptor_weights,
 	// and (via ftc_ensure_digitchain_decoder) the fT19 digit-chain tree.
 	for(i=0; i<FTC_DESCRIPTORTABLE_LEN; i++) ftc_leaf_weight_set(&ctx->dec, i*4, ctx->dec.tbls->ftc_descriptor_weights[i]);
 	if(!ftc_build_tree(&ctx->dec) || !ftc_build_decoder(&ctx->dec, &ctx->dec.dec_descriptor)) {
-		ftc_fail(ctx, "Internal Huffman tree build failure");
+		ftc_fail_internal(ctx); // "Internal Huffman tree build failure"
 		goto done;
 	}
 
 	ctx->dec.stream_pos = (u32)FTC_PRESET_DICT_LEN;
 	if(!ftc_ensure_digitchain_decoder(&ctx->dec, FTC_MODE_FT19)) {
-		ftc_fail(ctx, "Internal Huffman tree build failure");
+		ftc_fail_internal(ctx); // "Internal Huffman tree build failure"
 		goto done;
 	}
 
-	ftc_decode_member(ctx);
+	ftc_decode_item_main(ctx);
 
 done:
 	dbuf_flush(dcmpro->f);
@@ -1551,6 +1540,7 @@ done:
 		fmtutil_huffman_destroy_decoder(c, ctx->dec.dec_descriptor);
 		fmtutil_huffman_destroy_decoder(c, ctx->dec.dec_digitchain);
 		de_lz77buffer_destroy(c, ctx->hb.ring);
+		dbuf_close(ctx->hb.outf);
 		de_free(c, ctx);
 	}
 	dres->bytes_consumed_valid = 1;
