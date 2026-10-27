@@ -42,7 +42,6 @@ struct ver_info_struct {
 	char pklver_str[40];
 };
 
-
 #define PKL_DVER_UNKNOWN  0
 #define PKL_DVER_MAYBETA  10005
 #define PKL_DVER_JULBETA  10007
@@ -85,6 +84,7 @@ typedef struct localctx_pklite {
 	u8 load_high;
 	u8 has_psp_sig;
 	u8 psp_sig_type;
+	u8 has_startup_patch;
 	int default_code_alignment;
 	struct decompr_params_struct dparams;
 
@@ -158,6 +158,11 @@ typedef struct localctx_pklite {
 	i64 cmpr_reloc_tbl_len;
 	i64 cmpr_data_area_endpos; // where the footer ends
 	i64 footer_pos; // 0 if unknown
+
+	i64 startup_patch_pos; // valid if has_startup_patch
+	i64 adjusted_host_entry_point;
+	i64 saved_orig_host_entry_point;
+
 	struct footer_struct footer;
 	UI ax_val;
 	u8 using_copy_of_exe_header;
@@ -181,6 +186,7 @@ struct decompr_internal_state {
 	dbuf *inf;
 	const struct decompr_params_struct *dparams;
 	u8 has_uncompressed_area;
+	u8 allow_unc_area_in_history;
 	i64 dcmpr_code_nbytes_written;
 	i64 dcmpr_cur_ipos;
 	i64 unc_area_wpos; // # of bytes written as of the end of the last unc. area
@@ -990,12 +996,22 @@ static void do_analyze_pklite_exe(deark *c, lctx *d)
 	}
 
 	if(d->data_before_decoder) {
-		d->approx_end_of_decompressor = d->host_ei->end_of_dos_code - d->host_ei->entry_point;
+		if(d->has_startup_patch) {
+			d->approx_end_of_decompressor = d->startup_patch_pos - d->host_ei->entry_point;
+		}
+		else {
+			d->approx_end_of_decompressor = d->host_ei->end_of_dos_code - d->host_ei->entry_point;
+		}
 		d->cmpr_data_area_endpos = d->host_ei->entry_point;
 	}
 	else {
 		d->approx_end_of_decompressor = d->dparams.cmpr_data_pos - d->host_ei->entry_point;
-		d->cmpr_data_area_endpos = d->host_ei->end_of_dos_code;
+		if(d->has_startup_patch) {
+			d->cmpr_data_area_endpos = d->saved_orig_host_entry_point;
+		}
+		else {
+			d->cmpr_data_area_endpos = d->host_ei->end_of_dos_code;
+		}
 	}
 	de_dbg(c, "approx end of decompressor: ep+%"I64_FMT, d->approx_end_of_decompressor);
 
@@ -1188,7 +1204,18 @@ static void do_uncompressed_area(deark *c, struct decompr_internal_state *dctx,
 	UI len;
 	UI i;
 	u8 b;
-	const u8 *uasig = (const u8*)"PKLITE\x26\xa3";
+	static const u8 uasig[9] = {'P', 'K', 'L', 'I', 'T', 'E', 0x26, 0xa3 };
+	struct pklhisthack_item {
+		u32 pos; // Relative to start_of_dos_code (most likely 96)
+		u8 bytes[9];
+	};
+	static const struct pklhisthack_item pklhisthack_arr[] = {
+		{ 19652, { 0xb8, 0x1d, 0xf9, 0x7f, 0x17, 0x14, 0xd3, 0xb5, 0xbe } }, // PKZIP 2.04c-reg
+		{ 20084, { 0xaa, 0x8a, 0x07, 0xa4, 0x89, 0xc9, 0x97, 0x21, 0x58 } } // PKZIP 2.04e-reg
+	};
+	u8 use_histhack = 0;
+	UI histhack_item_to_use = 0;
+	UI k;
 
 	dctx->has_uncompressed_area = 1;
 	len = (UI)dbuf_getbyte_p(dctx->inf, &dctx->dcmpr_cur_ipos);
@@ -1212,32 +1239,26 @@ static void do_uncompressed_area(deark *c, struct decompr_internal_state *dctx,
 	//
 	// For PKZIP 2.04g+, after an uncompressed area, no copy-from-history
 	// instructions ever refer to that area, or anything before it. So, it
-	// doesn't matter what we write to history.
+	// doesn't matter what we write to history. (We'll just write zeroes.)
 	//
 	// Unfortunately, that's not the case for PKZIP 2.04c and 2.04e. They are
 	// compressed with an internal version of PKLITE for which this feature
 	// was new, and worked differently, and was apparently buggy.
-	//
-	// We need to know *exactly* what state our history buffer should be in
-	// after an uncompressed area. I've tried to figure it out, but so far
-	// without success (help wanted).
-	//
-	// If we don't get it right, the rest of the file will be corrupted.
-	// Instead of producing garbage, if we see a reference to unknown history,
-	// we fail completely.
+	// The 9 mystery bytes do participate in the compression of the rest of
+	// the file, so we have to figure out what they are.
+	// They appear in the compressed data, but I haven't figured out the
+	// logic for where they appear.
+	// For now, we'll just do an ugly hack to support the two known files,
+	// PKZIP.EXE 2.04{c,e}-reg.
 	//
 	// ---
 	//
 	// Research notes:
 	//
-	// These are the files I have with an uncompressed area:
-	//  PKZIP.EXE 2.04c, 41772 bytes in size
-	//  PKZIP.EXE 2.04e, 42861
-	//  PKZIP.EXE 2.04g, 42552
-	//  PKZIP.EXE 2.04g Shareware Marketing edition, 42632
-	//  PKZIP.EXE 2.04(g) French, 44020
-	//  PKZIP.EXE 2.06 (IBM), 49527
-	//  PKZIP.EXE 2.50, 51308
+	// Examples of files with an uncompressed area:
+	//  PKZIP.EXE 2.04c-reg, 41772 bytes in size
+	//  PKZIP.EXE 2.04e-reg, 42861
+	//  PKZIP.EXE 2.04g-reg, 42552
 	//
 	// v2.04c seems to get away with this carelessness, maybe just by luck.
 	//
@@ -1245,16 +1266,57 @@ static void do_uncompressed_area(deark *c, struct decompr_internal_state *dctx,
 	// In a hex editor, search for the signature "PKt0". Everything more than
 	// 64 bytes after the start of the siguature should be the same in every
 	// file, even those modified by PUTAV. But the two bytes 326 bytes after
-	// the start of the signature decompress differently in modified files.
+	// the start of the signature decompress differently in modified files,
+	// because they are copied from bytes modified by PUTAV.
 
-	for(i=0; i<8; i++) {
-		de_lz77buffer_add_literal_byte(ringbuf, uasig[i]);
+	// Test if the mystery bytes appear in one of the known places.
+	// If so, enable hackery.
+	for(k=0; k<DE_ARRAYCOUNT(pklhisthack_arr); k++) {
+		if(!dbuf_memcmp(dctx->inf,
+			dctx->d->host_ei->start_of_dos_code+(i64)pklhisthack_arr[k].pos,
+			pklhisthack_arr[k].bytes, 9))
+		{
+			use_histhack = 1;
+			histhack_item_to_use = k;
+			break;
+		}
 	}
-	de_lz77buffer_add_literal_byte(ringbuf, (u8)len);
 
+	dctx->allow_unc_area_in_history = use_histhack;
+
+	// The 9 bytes to write to history
+	for(i=0; i<9; i++) {
+		if(use_histhack) {
+			de_lz77buffer_add_history_byte(ringbuf,
+				pklhisthack_arr[histhack_item_to_use].bytes[i]);
+		}
+		else {
+			de_lz77buffer_add_history_byte(ringbuf, 0);
+		}
+	}
+
+	// The 9 bytes to write to the output file
+	for(i=0; i<8; i++) {
+		ringbuf->writebyte_cb(ringbuf, uasig[i]);
+	}
+	ringbuf->writebyte_cb(ringbuf, (u8)len);
+
+	// The uncompressed payload
 	for(i=0; i<len; i++) {
 		b = dbuf_getbyte_p(dctx->inf, &dctx->dcmpr_cur_ipos);
-		de_lz77buffer_add_literal_byte(ringbuf, b);
+		if(use_histhack) {
+			// Writing these bytes to history can't really be the "correct" thing
+			// to do, not if these bytes can be modified after compression.
+			// But it is what these actual compressed files do.
+			// If we know what the bytes were when the file was compressed (and
+			// we probably do), we *could* "fix" it by writing the original bytes
+			// to history instead of the current ones.
+			de_lz77buffer_add_history_byte(ringbuf, b);
+		}
+		else {
+			de_lz77buffer_add_history_byte(ringbuf, 0);
+		}
+		ringbuf->writebyte_cb(ringbuf, b);
 	}
 
 	dctx->unc_area_wpos = dctx->dcmpr_code_nbytes_written;
@@ -1439,7 +1501,7 @@ static void do_decompress(deark *c, lctx *d)
 			de_dbg3(c, "match pos=%u len=%u", matchpos, matchlen);
 		}
 
-		if(dctx->has_uncompressed_area &&
+		if(dctx->has_uncompressed_area && !dctx->allow_unc_area_in_history &&
 			matchpos>(dctx->dcmpr_code_nbytes_written - dctx->unc_area_wpos))
 		{
 			de_err(c, "Don't know how to decompress this file (problem with uncompressed area)");
@@ -2565,6 +2627,38 @@ done:
 	}
 }
 
+static void pkl_detect_pklaxfix(deark *c, lctx *d)
+{
+	i64 regCS_2;
+	i64 regIP_2;
+	i64 pos1 = d->host_ei->end_of_dos_code-17;
+
+	if(d->host_ei->entry_point != pos1) return;
+	if(de_getbyte(pos1+8)!=0x05 ||
+		de_getbyte(pos1+12)!=0xb8)
+	{
+		return;
+	}
+	regCS_2 = de_geti16le(pos1+9);
+	regIP_2 = de_getu16le(pos1+13);
+	d->has_startup_patch = 1;
+	d->startup_patch_pos = pos1;
+	d->adjusted_host_entry_point = d->host_ei->start_of_dos_code + regCS_2*16 + regIP_2;
+}
+
+// This is an experiment in supporting lightly-patched PKLITE files, for which
+// it's okay to throw away the patch.
+// TODO: As of this writing, these files are not detected by the "exe" module,
+// so they don't work automatically. Need to figure out how to do that, without
+// duplicating too much code, or making an ugly mess. And it probably should
+// work consistently with how the LHARK-SFX and PCX2EXE patched LZEXE files work.
+//
+// If a patch is found, sets d->has_startup_patch, and related things.
+static void pkl_detect_startup_patch(deark *c, lctx *d)
+{
+	pkl_detect_pklaxfix(c, d);
+}
+
 static void do_pklite_exe(deark *c, lctx *d)
 {
 	const char *s;
@@ -2580,6 +2674,14 @@ static void do_pklite_exe(deark *c, lctx *d)
 	}
 
 	fmtutil_collect_exe_info(c, c->infile, d->host_ei);
+
+	pkl_detect_startup_patch(c, d);
+	if(d->has_startup_patch) {
+		de_dbg(c, "[startup patch detected]");
+		d->saved_orig_host_entry_point = d->host_ei->entry_point;
+		// Changing host_ei->entry_point is a hack, but it makes it easier.
+		d->host_ei->entry_point = d->adjusted_host_entry_point;
+	}
 
 	de_read(d->epbytes, d->host_ei->entry_point, EPBYTES_LEN);
 	d->intro_class_fmtutil = fmtutil_detect_pklite_by_exe_ep(c, d->epbytes, EPBYTES_LEN, 0xff);
